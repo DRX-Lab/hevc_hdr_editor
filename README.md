@@ -1,61 +1,67 @@
-## hevc_hdr_editor
+## hevc_hdr_editor (Python)
 
-Utility to losslessly edit HDR metadata in HEVC files 
+Losslessly edit **HDR10 metadata (MDCV + CLL)** in HEVC (H.265) files.
 
-## **Building**
-### **Toolchain**
+---
 
-The minimum Rust version to build **`hevc_hdr_editor`** is 1.85.0.
+## Requirements
 
-### **Release binary**
-To build release binary in `target/release/hevc_hdr_editor` run:
-```console
-cargo build --release
-```
+* **Python 3.9+**
+* **ffmpeg / ffprobe** in PATH (only for MKV/MP4/MOV)
 
-&nbsp;
+---
+
+## Supported inputs
+
+* Raw HEVC Annex-B (`.hevc`)
+* Containers with HEVC video:
+
+  * `.mkv`, `.mp4`, `.mov`, `.m4v`
+
+---
 
 ## Usage
-```properties
-hevc_hdr_editor [OPTIONS] --config <CONFIG> video.hevc
+
+```console
+python hevc_hdr_editor.py -i INPUT -o OUTPUT -p PRESET [options]
 ```
 
-### Supported input files:
-- Raw HEVC bitstream
-- Matroska (mkv) file with HEVC video track
+### Required
 
-### Edit config
+* `-i, --input`  Input file
+* `-o, --output` Output file
+* `-p, --preset` `DisplayP3` or `BT2020`
 
-The config is expected to follow the template below:
-```json5
-{
-    // Replace the SMPTE ST 2086 Mastering Display metadata
-    "mdcv": {
-        // Existing preset display primaries (BT.709, Display-P3 or BT.2020)
-        // Options: "BT.709", "DisplayP3", "BT.2020"
-        "preset": "DisplayP3",
+### Optional
 
-        // If present, the specific primaries to use.
-        // Example for x265 string:
-        //   G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)
-        "primaries": {
-            // X, Y display primaries in RGB order as 16 bit integers
-            "display_primaries_x": [34000, 13250, 7500],
-            "display_primaries_y": [16000, 34500, 3000],
-            "white_point": [15635, 16450]
-        },
+* `--maxcll <int>`   (default: `1000`)
+* `--maxfall <int>`  (default: `400`)
+* `--maxmdl <float>` (default: `1000.0`)
+* `--minmdl <float>` (default: `0.0001`)
+* `--write-json <path>` Write generated HDR10 JSON (optional)
 
-        // min, max mastering display luminance in nits
-        "max_display_mastering_luminance": 1000,
-        "min_display_mastering_luminance": 0.0001
-    },
+---
 
-    // Replace the Content light level metadata
-    "cll": {
-        // MaxCLL value to set
-        "max_content_light_level": 1000,
-        // MaxFALL value to set
-        "max_average_light_level": 400
-    }
-}
+## Examples
+
+### Raw HEVC
+
+```console
+python hevc_hdr_editor.py -i video.hevc -o output.hevc -p BT2020 --maxcll 1200 --maxfall 500
 ```
+
+### MKV / MP4
+
+```console
+python hevc_hdr_editor.py -i input.mkv -o output.mkv -p DisplayP3
+```
+
+---
+
+## Output
+
+* HDR10 metadata is replaced or inserted
+* Video stream is rewritten **losslessly**
+* Progress shown from **1% to 100%**
+
+---
