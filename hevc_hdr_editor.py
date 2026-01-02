@@ -6,6 +6,9 @@ Edits HDR10 static metadata in HEVC (H.265) by replacing (or inserting) SEI pref
 - Mastering Display Colour Volume (MDCV / ST 2086)  payloadType = 137
 - Content Light Level (CLL / MaxCLL+MaxFALL)       payloadType = 144
 
+Additionally (optional):
+- Strip SEI user_data_unregistered (payloadType = 5), typically used to embed "Writing library"/encoder strings.
+
 Supported inputs:
 1) Raw HEVC Annex-B elementary streams (start-code delimited)
 2) Matroska / MP4 / MOV containers (via ffmpeg extract + remux)
@@ -18,11 +21,24 @@ CLI:
   --maxfall    default 400
   --maxmdl     default 1000.0 nits
   --minmdl     default 0.0001 nits
+  --add-if-missing / --no-add-if-missing
+      If enabled (default), and the stream contains *no* SEI prefix NAL units at all,
+      the tool will insert MDCV+CLL as two SEI prefix NAL units right before the first
+      VCL NAL unit (the first video slice), which is a safe/compatible insertion point.
+
+  --strip-user-data
+      Remove SEI user_data_unregistered (payloadType=5) messages found in SEI prefix NAL units.
+      This is commonly where encoder/“Writing library” strings live.
+
+  --strip-user-data-match "substring"
+      If set, only remove user_data_unregistered messages whose payload contains this substring
+      (searched in UTF-8 decoded text with errors ignored). If omitted and --strip-user-data is set,
+      removes all payloadType=5 messages.
 
 Behavior:
 - SEI Prefix NAL units are rewritten losslessly (nal_unit_type=39).
 - SEI messages are always split: each SEI message is written in its own SEI prefix NAL.
-- Streaming processing for raw input: does NOT load the entire file into memory (handles multi‑GB files).
+- Streaming processing for raw input: does NOT load the entire file into memory (handles multi-GB files).
 - Progress is printed to STDERR (1%..100%) based on bytes read.
 
 Performance notes:
@@ -48,6 +64,7 @@ from typing import Dict, List, Optional, Tuple, BinaryIO
 # HEVC NAL unit types
 NAL_SEI_PREFIX = 39  # prefix SEI
 # SEI payload types
+SEI_PAYLOAD_USER_DATA_UNREGISTERED = 5
 SEI_PAYLOAD_MDCV = 137  # MasteringDisplayColourVolume
 SEI_PAYLOAD_CLL = 144   # ContentLightLevel
 
@@ -88,9 +105,17 @@ class EditCll:
 
 
 @dataclass
+class EditStrip:
+    strip_user_data: bool
+    user_data_match: Optional[str]
+
+
+@dataclass
 class EditConfig:
     mdcv: EditMdcv
     cll: EditCll
+    add_if_missing: bool
+    strip: EditStrip
 
 
 class CountingReader:
@@ -152,6 +177,16 @@ def _is_container(path: str) -> bool:
 def _nal_type(nal_header: bytes) -> int:
     # forbidden_zero_bit(1) + nal_unit_type(6) + ...
     return (nal_header[0] >> 1) & 0x3F
+
+
+def _is_vcl_nal_type(ntype: int) -> bool:
+    # VCL NAL unit types in HEVC are 0..31
+    return 0 <= ntype <= 31
+
+
+def _sei_prefix_nal_header() -> bytes:
+    # nal_unit_type = 39 => 0x4E in first byte (39<<1), nuh_layer_id=0, tid_plus1=1
+    return b"\x4E\x01"
 
 
 def _is_rbsp_trailing_bits(rem: bytes) -> bool:
@@ -239,6 +274,14 @@ def _encode_sei_messages(messages: List[Tuple[int, bytes]]) -> bytes:
 
     rbsp.append(0x80)  # rbsp_trailing_bits
     return bytes(rbsp)
+
+
+def _make_single_sei_prefix_nal(start_code_len: int, payload_type: int, payload: bytes) -> bytes:
+    start_code = b"\x00\x00\x01" if start_code_len == 3 else b"\x00\x00\x00\x01"
+    nal_header = _sei_prefix_nal_header()
+    rbsp = _encode_sei_messages([(payload_type, payload)])
+    ebsp = _rbsp_to_ebsp(rbsp)
+    return start_code + nal_header + ebsp
 
 
 def _parse_mdcv(payload: bytes) -> Dict[str, object]:
@@ -337,11 +380,6 @@ def _iter_annexb_nals_stream(f: BinaryIO, chunk_size: int = 64 * 1024 * 1024):
     """
     Streaming Annex-B NAL iterator.
     Yields tuples: (start_code_len, nal_unit_without_start_code)
-
-    Implementation is optimized for large files:
-    - Uses bytearray for incremental buffer
-    - Uses .find() for start-code scanning (fast C implementation)
-    - Avoids per-byte Python loops
     """
     buf = bytearray()
     eof = False
@@ -422,6 +460,8 @@ def _process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, 
     if ntype != NAL_SEI_PREFIX:
         return start_code + nal
 
+    state["seen_sei_prefix"] = True
+
     nal_header = nal[:2]
     rbsp = _ebsp_to_rbsp(nal[2:])
     messages = _read_sei_messages(rbsp)
@@ -433,12 +473,21 @@ def _process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, 
     had_cll = any(t == SEI_PAYLOAD_CLL for t, _ in messages)
 
     existing_mdcv = next((p for t, p in messages if t == SEI_PAYLOAD_MDCV), None)
-    existing_cll = next((p for t, p in messages if t == SEI_PAYLOAD_CLL), None)
 
     out = bytearray()
 
-    # Split: one SEI message per SEI prefix NAL
+    # Split: one SEI message per SEI prefix NAL (with optional stripping of payloadType=5)
     for t, p in messages:
+        if cfg.strip.strip_user_data and t == SEI_PAYLOAD_USER_DATA_UNREGISTERED:
+            if cfg.strip.user_data_match is None:
+                continue
+            try:
+                txt = p.decode("utf-8", "ignore")
+            except Exception:
+                txt = ""
+            if cfg.strip.user_data_match in txt:
+                continue
+
         if t == SEI_PAYLOAD_MDCV:
             payload = _apply_mdcv(p, cfg.mdcv)
             state["mdcv"] = True
@@ -457,15 +506,17 @@ def _process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, 
     # Insert missing MDCV/CLL right after this SEI prefix only once globally
     if (not state["mdcv"]) and (not had_mdcv):
         payload = _apply_mdcv(existing_mdcv, cfg.mdcv)
-        one = [(SEI_PAYLOAD_MDCV, payload)]
-        out += start_code + nal_header + _rbsp_to_ebsp(_encode_sei_messages(one))
+        out += start_code + nal_header + _rbsp_to_ebsp(_encode_sei_messages([(SEI_PAYLOAD_MDCV, payload)]))
         state["mdcv"] = True
 
     if (not state["cll"]) and (not had_cll):
         payload = _apply_cll(cfg.cll)
-        one = [(SEI_PAYLOAD_CLL, payload)]
-        out += start_code + nal_header + _rbsp_to_ebsp(_encode_sei_messages(one))
+        out += start_code + nal_header + _rbsp_to_ebsp(_encode_sei_messages([(SEI_PAYLOAD_CLL, payload)]))
         state["cll"] = True
+
+    # If everything got stripped and nothing was inserted, remove this SEI prefix NAL completely.
+    if len(out) == 0:
+        return b""
 
     return bytes(out)
 
@@ -478,7 +529,13 @@ def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -
         except OSError:
             total_size = None
 
-    state = {"mdcv": False, "cll": False}
+    # state flags
+    state = {
+        "mdcv": False,
+        "cll": False,
+        "seen_sei_prefix": False,
+        "inserted_before_vcl": False,
+    }
     last_percent = -1
     reader: Optional[CountingReader] = None
 
@@ -502,6 +559,7 @@ def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -
 
     try:
         for sc_len, nal in _iter_annexb_nals_stream(in_f, chunk_size=chunk_size):
+            # progress
             if total_size is not None and input_path != "-":
                 bytes_read = reader.bytes_read if reader is not None else 0
                 percent = int((bytes_read * 100) / total_size) if total_size > 0 else 100
@@ -511,13 +569,31 @@ def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -
                     _print_progress(percent)
                     last_percent = percent
 
+            # If stream has *no* SEI prefix NALs at all, optionally insert right before first VCL.
+            if cfg.add_if_missing and (not state["seen_sei_prefix"]) and (not state["inserted_before_vcl"]) and len(nal) >= 2:
+                ntype = _nal_type(nal[:2])
+                if _is_vcl_nal_type(ntype):
+                    # Insert both SEIs before this first slice NAL.
+                    mdcv_payload = _apply_mdcv(None, cfg.mdcv)
+                    cll_payload = _apply_cll(cfg.cll)
+                    out_f.write(_make_single_sei_prefix_nal(sc_len, SEI_PAYLOAD_MDCV, mdcv_payload))
+                    out_f.write(_make_single_sei_prefix_nal(sc_len, SEI_PAYLOAD_CLL, cll_payload))
+                    state["mdcv"] = True
+                    state["cll"] = True
+                    state["inserted_before_vcl"] = True
+
             out_f.write(_process_one_nal(sc_len, nal, cfg, state))
 
-        if not state["mdcv"] and not state["cll"]:
+        # If we never saw a SEI prefix NAL and we did not insert before VCL, decide what to do.
+        if not state["seen_sei_prefix"] and not state["inserted_before_vcl"]:
+            if cfg.add_if_missing:
+                raise RuntimeError(
+                    "No VCL NAL units were found to anchor insertion (unexpected/invalid stream). "
+                    "HDR metadata could not be inserted."
+                )
             raise RuntimeError(
                 "No SEI Prefix NAL units were found, so HDR metadata could not be inserted. "
-                "Provide a stream that already contains SEI prefix NALs, or extend the tool to "
-                "insert after VPS/SPS/PPS."
+                "Re-run with --add-if-missing to insert MDCV/CLL before the first VCL NAL."
             )
 
         if total_size is not None and last_percent < 100:
@@ -525,7 +601,7 @@ def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -
 
     finally:
         if input_path != "-":
-            in_f.close()  # CountingReader.close() closes the wrapped file
+            in_f.close()
         if output_path != "-":
             out_f.close()
 
@@ -587,6 +663,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--maxmdl", type=float, default=1000.0, help="Max mastering display luminance in nits (default: 1000).")
     parser.add_argument("--minmdl", type=float, default=0.0001, help="Min mastering display luminance in nits (default: 0.0001).")
     parser.add_argument("--write-json", default=None, help="If set, writes the generated HDR10 JSON metadata to this path (for inspection).")
+
+    add_group = parser.add_mutually_exclusive_group()
+    add_group.add_argument(
+        "--add-if-missing",
+        dest="add_if_missing",
+        action="store_true",
+        help="If the stream has no SEI prefix NALs, insert MDCV+CLL before the first VCL NAL (default).",
+    )
+    add_group.add_argument(
+        "--no-add-if-missing",
+        dest="add_if_missing",
+        action="store_false",
+        help="Disable insertion when a stream has no SEI prefix NALs (old behavior: error).",
+    )
+    parser.set_defaults(add_if_missing=True)
+
+    parser.add_argument(
+        "--strip-user-data",
+        action="store_true",
+        help="Remove SEI user_data_unregistered (payloadType=5) messages from SEI prefix NAL units.",
+    )
+    parser.add_argument(
+        "--strip-user-data-match",
+        default=None,
+        help="If set, only remove user_data_unregistered messages whose payload contains this UTF-8 substring "
+             "(e.g. 'Tencent-V265' or 'x265'). If omitted and --strip-user-data is set, removes all payloadType=5.",
+    )
+
     return parser
 
 
@@ -600,7 +704,11 @@ def _build_cfg_from_args(args: argparse.Namespace) -> EditConfig:
         max_content_light_level=int(args.maxcll),
         max_average_light_level=int(args.maxfall),
     )
-    return EditConfig(mdcv=mdcv, cll=cll)
+    strip = EditStrip(
+        strip_user_data=bool(getattr(args, "strip_user_data", False)),
+        user_data_match=getattr(args, "strip_user_data_match", None),
+    )
+    return EditConfig(mdcv=mdcv, cll=cll, add_if_missing=bool(args.add_if_missing), strip=strip)
 
 
 def _maybe_write_json(args: argparse.Namespace) -> None:
@@ -621,6 +729,11 @@ def _maybe_write_json(args: argparse.Namespace) -> None:
         "cll": {
             "max_content_light_level": int(args.maxcll),
             "max_average_light_level": int(args.maxfall),
+        },
+        "add_if_missing": bool(args.add_if_missing),
+        "strip": {
+            "strip_user_data": bool(getattr(args, "strip_user_data", False)),
+            "user_data_match": getattr(args, "strip_user_data_match", None),
         },
     }
     out_path = os.path.abspath(args.write_json)
