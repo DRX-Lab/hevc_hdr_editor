@@ -3,47 +3,51 @@
 hevc_hdr_editor.py
 
 Edits HDR10 static metadata in HEVC (H.265) by replacing (or inserting) SEI prefix messages:
-- Mastering Display Colour Volume (MDCV / ST 2086)  payloadType = 137
-- Content Light Level (CLL / MaxCLL+MaxFALL)       payloadType = 144
+- Mastering Display Colour Volume (MDCV / SMPTE ST 2086) payloadType = 137
+- Content Light Level (CLL / MaxCLL + MaxFALL)          payloadType = 144
 
-Additionally (optional):
-- Strip SEI user_data_unregistered (payloadType = 5), typically used to embed "Writing library"/encoder strings.
+Also supports (optional) SPS/VUI edits that affect what MediaInfo shows as:
+- "Standard : NTSC"          -> SPS VUI video_format (3 bits)
+- "Color range : Limited/Full" -> SPS VUI video_full_range_flag (1 bit)
+
+Also supports (optional) removal of encoder strings:
+- Strip SEI user_data_unregistered (payloadType = 5), often used for "Writing library"/encoder tags.
 
 Supported inputs:
 1) Raw HEVC Annex-B elementary streams (start-code delimited)
 2) Matroska / MP4 / MOV containers (via ffmpeg extract + remux)
 
-CLI:
-  -i/--input   input file (raw .hevc Annex-B or container .mkv/.mp4/.mov/.m4v)
-  -o/--output  output file
-  -p/--preset  DisplayP3 or BT2020
-  --maxcll     default 1000
-  --maxfall    default 400
-  --maxmdl     default 1000.0 nits
-  --minmdl     default 0.0001 nits
-  --add-if-missing / --no-add-if-missing
+CLI (short + long options):
+  -i / --input        Input file (raw .hevc Annex-B OR container .mkv/.mp4/.mov/.m4v). Use '-' for stdin (raw only).
+  -o / --output       Output file. Use '-' for stdout (raw only).
+
+  -p / --preset       HDR primaries preset: p3 or 2020
+                      (Used when writing/replacing MDCV primaries + white point.)
+
+  -C / --maxcll       MaxCLL value (nits) for CLL SEI (payloadType=144)
+  -F / --maxfall      MaxFALL value (nits) for CLL SEI (payloadType=144)
+  -M / --maxmdl       Max mastering display luminance (nits) for MDCV SEI (payloadType=137)
+  -m / --minmdl       Min mastering display luminance (nits) for MDCV SEI (payloadType=137)
+
+  -a / --add-if-missing
+  -A / --no-add-if-missing
       If enabled (default), and the stream contains *no* SEI prefix NAL units at all,
-      the tool will insert MDCV+CLL as two SEI prefix NAL units right before the first
-      VCL NAL unit (the first video slice), which is a safe/compatible insertion point.
+      insert MDCV+CLL as two SEI prefix NAL units right before the first VCL NAL unit.
 
-  --strip-user-data
-      Remove SEI user_data_unregistered (payloadType=5) messages found in SEI prefix NAL units.
-      This is commonly where encoder/“Writing library” strings live.
+  -u / --strip-user-data
+      Remove SEI user_data_unregistered (payloadType=5) messages from SEI prefix NAL units
+      (commonly encoder / "Writing library" strings).
 
-  --strip-user-data-match "substring"
-      If set, only remove user_data_unregistered messages whose payload contains this substring
-      (searched in UTF-8 decoded text with errors ignored). If omitted and --strip-user-data is set,
-      removes all payloadType=5 messages.
+  -s / --standard     component|pal|ntsc|secam|mac|unspec
+      Set SPS VUI video_format (MediaInfo "Standard"). Use "unspec" to remove "Standard : NTSC".
 
-Behavior:
-- SEI Prefix NAL units are rewritten losslessly (nal_unit_type=39).
-- SEI messages are always split: each SEI message is written in its own SEI prefix NAL.
+  -r / --range        limited|full
+      Set SPS VUI video_full_range_flag (MediaInfo "Color range").
+
+Notes / Safety:
+- This tool performs signaling edits. Changing "Color range" flag does NOT convert pixel levels.
 - Streaming processing for raw input: does NOT load the entire file into memory (handles multi-GB files).
-- Progress is printed to STDERR (1%..100%) based on bytes read.
-
-Performance notes:
-- Uses fast start-code scanning via bytearray.find (no per-byte Python loops).
-- Uses large read chunks by default for higher throughput on Windows.
+- Progress is printed to STDERR (1%..100%) based on bytes read (raw input only).
 
 Container requirement:
 - ffmpeg + ffprobe must be available on PATH.
@@ -52,7 +56,6 @@ Container requirement:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import struct
 import subprocess
@@ -61,12 +64,18 @@ import tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, BinaryIO
 
+# ----------------------------
+# Constants / Tables
+# ----------------------------
+
 # HEVC NAL unit types
 NAL_SEI_PREFIX = 39  # prefix SEI
+NAL_SPS = 33         # SPS
+
 # SEI payload types
 SEI_PAYLOAD_USER_DATA_UNREGISTERED = 5
-SEI_PAYLOAD_MDCV = 137  # MasteringDisplayColourVolume
-SEI_PAYLOAD_CLL = 144   # ContentLightLevel
+SEI_PAYLOAD_MDCV = 137  # MasteringDisplayColourVolume (ST 2086)
+SEI_PAYLOAD_CLL = 144   # ContentLightLevel (MaxCLL/MaxFALL)
 
 D65_WHITEPOINT = (15635, 16450)
 MDL_FACTOR = 10000.0  # nits -> units of 0.0001 nits
@@ -90,24 +99,48 @@ PRESET_PRIMARIES: Dict[str, Dict[str, Tuple[int, ...]]] = {
     },
 }
 
+# SPS VUI mappings (MediaInfo)
+VIDEO_FORMAT_MAP = {
+    0: "component",
+    1: "pal",
+    2: "ntsc",
+    3: "secam",
+    4: "mac",
+    5: "unspec",
+}
+VIDEO_FORMAT_INV = {v: k for k, v in VIDEO_FORMAT_MAP.items()}
+
+RANGE_INV = {"limited": 0, "full": 1}
+
+_START3 = b"\x00\x00\x01"
+
+
+# ----------------------------
+# Dataclasses
+# ----------------------------
 
 @dataclass
 class EditMdcv:
     preset: str
-    max_display_mastering_luminance: float  # nits
-    min_display_mastering_luminance: float  # nits
+    max_display_mastering_luminance: Optional[float]  # nits (None => do not override)
+    min_display_mastering_luminance: Optional[float]  # nits (None => do not override)
 
 
 @dataclass
 class EditCll:
-    max_content_light_level: int
-    max_average_light_level: int
+    max_content_light_level: Optional[int]   # None => do not override
+    max_average_light_level: Optional[int]   # None => do not override
 
 
 @dataclass
 class EditStrip:
     strip_user_data: bool
-    user_data_match: Optional[str]
+
+
+@dataclass
+class EditSpsVui:
+    standard: Optional[int]      # video_format (0..7)
+    full_range: Optional[int]    # video_full_range_flag (0/1)
 
 
 @dataclass
@@ -116,12 +149,13 @@ class EditConfig:
     cll: EditCll
     add_if_missing: bool
     strip: EditStrip
+    sps_vui: EditSpsVui
 
 
 class CountingReader:
     """
     Wraps a binary file object and counts bytes read via .read().
-    This is reliable even when buffering/iterators are involved.
+    Reliable even with buffering.
     """
     def __init__(self, f: BinaryIO):
         self._f = f
@@ -143,7 +177,11 @@ class CountingReader:
             return self.bytes_read
 
 
-def _run(cmd: List[str]) -> None:
+# ----------------------------
+# External tools (ffmpeg/ffprobe)
+# ----------------------------
+
+def run_cmd(cmd: List[str]) -> None:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
         raise RuntimeError(
@@ -154,7 +192,7 @@ def _run(cmd: List[str]) -> None:
         )
 
 
-def _ffprobe_video_codec(path: str) -> Optional[str]:
+def ffprobe_video_codec(path: str) -> Optional[str]:
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -169,31 +207,35 @@ def _ffprobe_video_codec(path: str) -> Optional[str]:
     return codec or None
 
 
-def _is_container(path: str) -> bool:
+def is_container(path: str) -> bool:
     ext = os.path.splitext(path)[1].lower()
     return ext in {".mkv", ".mp4", ".mov", ".m4v"}
 
 
-def _nal_type(nal_header: bytes) -> int:
+# ----------------------------
+# NAL helpers
+# ----------------------------
+
+def nal_type(nal_header: bytes) -> int:
     # forbidden_zero_bit(1) + nal_unit_type(6) + ...
     return (nal_header[0] >> 1) & 0x3F
 
 
-def _is_vcl_nal_type(ntype: int) -> bool:
+def is_vcl_nal_type(ntype: int) -> bool:
     # VCL NAL unit types in HEVC are 0..31
     return 0 <= ntype <= 31
 
 
-def _sei_prefix_nal_header() -> bytes:
+def sei_prefix_nal_header() -> bytes:
     # nal_unit_type = 39 => 0x4E in first byte (39<<1), nuh_layer_id=0, tid_plus1=1
     return b"\x4E\x01"
 
 
-def _is_rbsp_trailing_bits(rem: bytes) -> bool:
+def is_rbsp_trailing_bits(rem: bytes) -> bool:
     return len(rem) >= 1 and rem[0] == 0x80 and all(b == 0x00 for b in rem[1:])
 
 
-def _ebsp_to_rbsp(ebsp: bytes) -> bytes:
+def ebsp_to_rbsp(ebsp: bytes) -> bytes:
     out = bytearray()
     zeros = 0
     i = 0
@@ -209,7 +251,7 @@ def _ebsp_to_rbsp(ebsp: bytes) -> bytes:
     return bytes(out)
 
 
-def _rbsp_to_ebsp(rbsp: bytes) -> bytes:
+def rbsp_to_ebsp(rbsp: bytes) -> bytes:
     out = bytearray()
     zeros = 0
     for b in rbsp:
@@ -221,12 +263,16 @@ def _rbsp_to_ebsp(rbsp: bytes) -> bytes:
     return bytes(out)
 
 
-def _read_sei_messages(rbsp: bytes) -> List[Tuple[int, bytes]]:
+# ----------------------------
+# SEI helpers
+# ----------------------------
+
+def read_sei_messages(rbsp: bytes) -> List[Tuple[int, bytes]]:
     msgs: List[Tuple[int, bytes]] = []
     i = 0
     n = len(rbsp)
     while i < n:
-        if _is_rbsp_trailing_bits(rbsp[i:]):
+        if is_rbsp_trailing_bits(rbsp[i:]):
             break
 
         payload_type = 0
@@ -255,7 +301,7 @@ def _read_sei_messages(rbsp: bytes) -> List[Tuple[int, bytes]]:
     return msgs
 
 
-def _encode_sei_messages(messages: List[Tuple[int, bytes]]) -> bytes:
+def encode_sei_messages(messages: List[Tuple[int, bytes]]) -> bytes:
     rbsp = bytearray()
     for payload_type, payload in messages:
         pt = payload_type
@@ -276,17 +322,21 @@ def _encode_sei_messages(messages: List[Tuple[int, bytes]]) -> bytes:
     return bytes(rbsp)
 
 
-def _make_single_sei_prefix_nal(start_code_len: int, payload_type: int, payload: bytes) -> bytes:
+def make_single_sei_prefix_nal(start_code_len: int, payload_type: int, payload: bytes) -> bytes:
     start_code = b"\x00\x00\x01" if start_code_len == 3 else b"\x00\x00\x00\x01"
-    nal_header = _sei_prefix_nal_header()
-    rbsp = _encode_sei_messages([(payload_type, payload)])
-    ebsp = _rbsp_to_ebsp(rbsp)
+    nal_header = sei_prefix_nal_header()
+    rbsp = encode_sei_messages([(payload_type, payload)])
+    ebsp = rbsp_to_ebsp(rbsp)
     return start_code + nal_header + ebsp
 
 
-def _parse_mdcv(payload: bytes) -> Dict[str, object]:
+# ----------------------------
+# HDR payload builders
+# ----------------------------
+
+def parse_mdcv(payload: bytes) -> Dict[str, object]:
     """
-    MDCV payload layout (interleaved, as commonly displayed by MediaInfo):
+    MDCV payload layout (interleaved):
         xR, yR, xG, yG, xB, yB,
         white_point_x, white_point_y,
         max_luminance, min_luminance
@@ -308,21 +358,21 @@ def _parse_mdcv(payload: bytes) -> Dict[str, object]:
     }
 
 
-def _encode_mdcv(fields: Dict[str, object]) -> bytes:
+def encode_mdcv(fields: Dict[str, object]) -> bytes:
     dp_x = list(fields["display_primaries_x"])
     dp_y = list(fields["display_primaries_y"])
     wp = list(fields["white_point"])
     max_u = int(fields["max_display_mastering_luminance_units"])
     min_u = int(fields["min_display_mastering_luminance_units"])
-    prim = [dp_x[0], dp_y[0], dp_x[1], dp_y[1], dp_x[2], dp_y[2]]  # interleaved
+    prim = [dp_x[0], dp_y[0], dp_x[1], dp_y[1], dp_x[2], dp_y[2]]
     return struct.pack(">6H2H2I", *(prim + wp + [max_u, min_u]))
 
 
-def _encode_cll(max_cll: int, max_fall: int) -> bytes:
+def encode_cll(max_cll: int, max_fall: int) -> bytes:
     return struct.pack(">2H", max_cll & 0xFFFF, max_fall & 0xFFFF)
 
 
-def _default_mdcv_fields(preset: str) -> Dict[str, object]:
+def default_mdcv_fields(preset: str) -> Dict[str, object]:
     p = PRESET_PRIMARIES[preset]
     return {
         "display_primaries_x": list(p["display_primaries_x"]),
@@ -333,24 +383,41 @@ def _default_mdcv_fields(preset: str) -> Dict[str, object]:
     }
 
 
-def _apply_mdcv(existing_payload: Optional[bytes], cfg: EditMdcv) -> bytes:
-    fields = _parse_mdcv(existing_payload) if existing_payload else _default_mdcv_fields(cfg.preset)
+def apply_mdcv(existing_payload: Optional[bytes], cfg: EditMdcv) -> bytes:
+    # Start from existing if present, else from preset defaults
+    fields = parse_mdcv(existing_payload) if existing_payload else default_mdcv_fields(cfg.preset)
 
+    # Always set primaries/whitepoint to preset
     p = PRESET_PRIMARIES[cfg.preset]
     fields["display_primaries_x"] = list(p["display_primaries_x"])
     fields["display_primaries_y"] = list(p["display_primaries_y"])
     fields["white_point"] = list(p["white_point"])
 
-    fields["max_display_mastering_luminance_units"] = int(round(cfg.max_display_mastering_luminance * MDL_FACTOR))
-    fields["min_display_mastering_luminance_units"] = int(round(cfg.min_display_mastering_luminance * MDL_FACTOR))
-    return _encode_mdcv(fields)
+    # Override luminance only if provided
+    if cfg.max_display_mastering_luminance is not None:
+        fields["max_display_mastering_luminance_units"] = int(round(cfg.max_display_mastering_luminance * MDL_FACTOR))
+    if cfg.min_display_mastering_luminance is not None:
+        fields["min_display_mastering_luminance_units"] = int(round(cfg.min_display_mastering_luminance * MDL_FACTOR))
+
+    return encode_mdcv(fields)
 
 
-def _apply_cll(cfg: EditCll) -> bytes:
-    return _encode_cll(cfg.max_content_light_level, cfg.max_average_light_level)
+def apply_cll(existing_payload: Optional[bytes], cfg: EditCll) -> bytes:
+    # If user did not provide both values, preserve existing if possible
+    if cfg.max_content_light_level is None or cfg.max_average_light_level is None:
+        if existing_payload is not None and len(existing_payload) >= 4:
+            return existing_payload[:4]
+        # If missing and user didn't provide, insert 0/0 (valid but meaningless)
+        return encode_cll(0, 0)
+
+    return encode_cll(cfg.max_content_light_level, cfg.max_average_light_level)
 
 
-def _print_progress(percent: int, bar_width: int = 46) -> None:
+# ----------------------------
+# Progress
+# ----------------------------
+
+def print_progress(percent: int, bar_width: int = 46) -> None:
     filled = int(round((percent / 100.0) * bar_width))
     bar = "■" * filled + " " * (bar_width - filled)
     sys.stderr.write(f"\r[{bar}] {percent:.1f}%")
@@ -360,14 +427,11 @@ def _print_progress(percent: int, bar_width: int = 46) -> None:
         sys.stderr.flush()
 
 
-_START3 = b"\x00\x00\x01"
+# ----------------------------
+# Annex-B iterator
+# ----------------------------
 
-
-def _find_next_start_code(buf: bytearray, start: int) -> Optional[Tuple[int, int]]:
-    """
-    Fast search for the next Annex-B start code using bytearray.find.
-    Returns (pos, length) where length is 3 or 4.
-    """
+def find_next_start_code(buf: bytearray, start: int) -> Optional[Tuple[int, int]]:
     pos = buf.find(_START3, start)
     if pos == -1:
         return None
@@ -376,18 +440,17 @@ def _find_next_start_code(buf: bytearray, start: int) -> Optional[Tuple[int, int
     return (pos, 3)
 
 
-def _iter_annexb_nals_stream(f: BinaryIO, chunk_size: int = 64 * 1024 * 1024):
+def iter_annexb_nals_stream(f: BinaryIO, chunk_size: int = 64 * 1024 * 1024):
     """
     Streaming Annex-B NAL iterator.
-    Yields tuples: (start_code_len, nal_unit_without_start_code)
+    Yields: (start_code_len, nal_without_start_code)
     """
     buf = bytearray()
     eof = False
     offset = 0
 
-    # Fill until first start code
     while True:
-        sc = _find_next_start_code(buf, offset)
+        sc = find_next_start_code(buf, offset)
         if sc:
             pos, _ = sc
             if pos > 0:
@@ -402,9 +465,7 @@ def _iter_annexb_nals_stream(f: BinaryIO, chunk_size: int = 64 * 1024 * 1024):
         else:
             buf.extend(chunk)
 
-    # Iterate NALs
     while True:
-        # Determine current start code length
         if len(buf) - offset < 4:
             if eof:
                 return
@@ -417,18 +478,16 @@ def _iter_annexb_nals_stream(f: BinaryIO, chunk_size: int = 64 * 1024 * 1024):
 
         cur_sc_len = 4 if buf[offset:offset + 4] == b"\x00\x00\x00\x01" else 3
 
-        # Find next start code after current one
-        next_sc = _find_next_start_code(buf, offset + cur_sc_len)
+        next_sc = find_next_start_code(buf, offset + cur_sc_len)
         while next_sc is None and not eof:
             chunk = f.read(chunk_size)
             if not chunk:
                 eof = True
                 break
             buf.extend(chunk)
-            next_sc = _find_next_start_code(buf, offset + cur_sc_len)
+            next_sc = find_next_start_code(buf, offset + cur_sc_len)
 
         if next_sc is None and eof:
-            # Last NAL
             nal = bytes(buf[offset + cur_sc_len:])
             yield (cur_sc_len, nal)
             return
@@ -437,34 +496,274 @@ def _iter_annexb_nals_stream(f: BinaryIO, chunk_size: int = 64 * 1024 * 1024):
         nal = bytes(buf[offset + cur_sc_len:next_pos])
         yield (cur_sc_len, nal)
 
-        # Advance offset to next_pos
         offset = next_pos
-
-        # Trim buffer occasionally to avoid unbounded growth
         if offset > 8 * 1024 * 1024:
             del buf[:offset]
             offset = 0
 
 
-def _process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, bool]) -> bytes:
+# ----------------------------
+# SPS/VUI bit editing (Standard / Color range)
+# ----------------------------
+
+class BitReader:
+    __slots__ = ("data", "bitpos", "size_bits")
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.bitpos = 0
+        self.size_bits = len(data) * 8
+
+    def read_bits(self, n: int) -> int:
+        if n == 0:
+            return 0
+        if self.bitpos + n > self.size_bits:
+            raise ValueError("BitReader: out of data")
+        val = 0
+        for _ in range(n):
+            byte_i = self.bitpos >> 3
+            bit_i = 7 - (self.bitpos & 7)
+            val = (val << 1) | ((self.data[byte_i] >> bit_i) & 1)
+            self.bitpos += 1
+        return val
+
+    def read_bool(self) -> int:
+        return self.read_bits(1)
+
+    def read_ue(self) -> int:
+        zeros = 0
+        while True:
+            b = self.read_bits(1)
+            if b == 0:
+                zeros += 1
+            else:
+                break
+        if zeros == 0:
+            return 0
+        info = self.read_bits(zeros)
+        return (1 << zeros) - 1 + info
+
+
+def skip_profile_tier_level(br: BitReader, max_sub_layers_minus1: int) -> None:
+    br.read_bits(2); br.read_bits(1); br.read_bits(5)
+    br.read_bits(32); br.read_bits(48); br.read_bits(8)
+
+    sub_layer_profile_present_flag = [0] * max_sub_layers_minus1
+    sub_layer_level_present_flag = [0] * max_sub_layers_minus1
+    for i in range(max_sub_layers_minus1):
+        sub_layer_profile_present_flag[i] = br.read_bool()
+        sub_layer_level_present_flag[i] = br.read_bool()
+
+    if max_sub_layers_minus1 > 0:
+        for _ in range(8 - max_sub_layers_minus1):
+            br.read_bits(2)
+
+    for i in range(max_sub_layers_minus1):
+        if sub_layer_profile_present_flag[i]:
+            br.read_bits(2); br.read_bits(1); br.read_bits(5)
+            br.read_bits(32); br.read_bits(48)
+        if sub_layer_level_present_flag[i]:
+            br.read_bits(8)
+
+
+def skip_short_term_ref_pic_set(br: BitReader, st_rps_idx: int, num_delta_pocs: List[int]) -> None:
+    inter_pred = 0
+    if st_rps_idx != 0:
+        inter_pred = br.read_bool()
+
+    if inter_pred:
+        delta_idx_minus1 = br.read_ue()
+        ref_rps_idx = st_rps_idx - (delta_idx_minus1 + 1)
+        if ref_rps_idx < 0 or ref_rps_idx >= st_rps_idx:
+            raise ValueError("Invalid ref_rps_idx while skipping RPS")
+
+        br.read_bool()  # delta_rps_sign
+        br.read_ue()    # abs_delta_rps_minus1
+        ndp = num_delta_pocs[ref_rps_idx]
+        for _ in range(ndp + 1):
+            used = br.read_bool()
+            if not used:
+                br.read_bool()
+        num_delta_pocs.append(ndp)
+    else:
+        num_negative = br.read_ue()
+        num_positive = br.read_ue()
+        for _ in range(num_negative):
+            br.read_ue(); br.read_bool()
+        for _ in range(num_positive):
+            br.read_ue(); br.read_bool()
+        num_delta_pocs.append(num_negative + num_positive)
+
+
+@dataclass
+class VuiLoc:
+    ok: bool
+    vf_bitpos: Optional[int] = None
+    vf_val: Optional[int] = None
+    vfr_bitpos: Optional[int] = None
+    vfr_val: Optional[int] = None
+
+
+def locate_vui_bits_in_sps(rbsp: bytes) -> VuiLoc:
+    br = BitReader(rbsp)
+
+    br.read_bits(4)
+    max_sub_layers_minus1 = br.read_bits(3)
+    br.read_bits(1)
+
+    skip_profile_tier_level(br, max_sub_layers_minus1)
+
+    br.read_ue()
+    chroma_format_idc = br.read_ue()
+    if chroma_format_idc == 3:
+        br.read_bits(1)
+
+    br.read_ue(); br.read_ue()
+
+    if br.read_bool():
+        br.read_ue(); br.read_ue(); br.read_ue(); br.read_ue()
+
+    br.read_ue(); br.read_ue(); br.read_ue()
+
+    sps_sub_layer_ordering_info_present_flag = br.read_bool()
+    start_i = 0 if sps_sub_layer_ordering_info_present_flag else max_sub_layers_minus1
+    for _ in range(start_i, max_sub_layers_minus1 + 1):
+        br.read_ue(); br.read_ue(); br.read_ue()
+
+    br.read_ue(); br.read_ue()
+    br.read_ue(); br.read_ue()
+    br.read_ue(); br.read_ue()
+
+    if br.read_bool():
+        if br.read_bool():
+            raise ValueError("scaling_list_data_present_flag=1 not supported for SPS editing.")
+
+    br.read_bool()
+    br.read_bool()
+
+    if br.read_bool():
+        br.read_bits(4); br.read_bits(4)
+        br.read_ue(); br.read_ue()
+        br.read_bool()
+
+    num_st_rps = br.read_ue()
+    num_delta_pocs: List[int] = []
+    for idx in range(num_st_rps):
+        skip_short_term_ref_pic_set(br, idx, num_delta_pocs)
+
+    if br.read_bool():
+        raise ValueError("long_term_ref_pics_present_flag=1 not supported for SPS editing.")
+
+    br.read_bool()
+    br.read_bool()
+
+    vui_present = bool(br.read_bool())
+    if not vui_present:
+        return VuiLoc(ok=False)
+
+    if br.read_bool():
+        aspect_ratio_idc = br.read_bits(8)
+        if aspect_ratio_idc == 255:
+            br.read_bits(16); br.read_bits(16)
+
+    if br.read_bool():
+        br.read_bool()
+
+    video_signal_type_present = bool(br.read_bool())
+    if not video_signal_type_present:
+        return VuiLoc(ok=False)
+
+    vf_bitpos = br.bitpos
+    vf_val = br.read_bits(3)
+
+    vfr_bitpos = br.bitpos
+    vfr_val = br.read_bool()
+
+    return VuiLoc(ok=True, vf_bitpos=vf_bitpos, vf_val=vf_val, vfr_bitpos=vfr_bitpos, vfr_val=vfr_val)
+
+
+def set_bits(rbsp: bytearray, bitpos: int, nbits: int, value: int) -> None:
+    for i in range(nbits):
+        bit = (value >> (nbits - 1 - i)) & 1
+        p = bitpos + i
+        byte_i = p >> 3
+        bit_i = 7 - (p & 7)
+        mask = 1 << bit_i
+        if bit:
+            rbsp[byte_i] |= mask
+        else:
+            rbsp[byte_i] &= (~mask) & 0xFF
+
+
+def edit_sps_vui_if_requested(nal: bytes, cfg: EditConfig) -> bytes:
+    if (cfg.sps_vui.standard is None) and (cfg.sps_vui.full_range is None):
+        return nal
+
+    if len(nal) < 2:
+        return nal
+
+    if nal_type(nal[:2]) != NAL_SPS:
+        return nal
+
+    hdr = nal[:2]
+    rbsp = ebsp_to_rbsp(nal[2:])
+
+    try:
+        loc = locate_vui_bits_in_sps(rbsp)
+    except Exception:
+        # Unsupported SPS features: do not touch
+        return nal
+
+    if not loc.ok:
+        return nal
+
+    rb = bytearray(rbsp)
+    changed = False
+
+    if cfg.sps_vui.standard is not None and loc.vf_bitpos is not None and loc.vf_val is not None:
+        if loc.vf_val != cfg.sps_vui.standard:
+            set_bits(rb, loc.vf_bitpos, 3, cfg.sps_vui.standard)
+            changed = True
+
+    if cfg.sps_vui.full_range is not None and loc.vfr_bitpos is not None and loc.vfr_val is not None:
+        if loc.vfr_val != cfg.sps_vui.full_range:
+            set_bits(rb, loc.vfr_bitpos, 1, cfg.sps_vui.full_range)
+            changed = True
+
+    if not changed:
+        return nal
+
+    return hdr + rbsp_to_ebsp(bytes(rb))
+
+
+# ----------------------------
+# Core NAL processing
+# ----------------------------
+
+def process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, bool]) -> bytes:
     """
     Returns bytes to write for this NAL, including its start code.
-    'state' tracks whether MDCV/CLL have been output at least once (global insertion).
+    Applies optional SPS edits (Standard/Range) and SEI HDR edits.
     """
     start_code = b"\x00\x00\x01" if sc_len == 3 else b"\x00\x00\x00\x01"
 
     if len(nal) < 2:
         return start_code + nal
 
-    ntype = _nal_type(nal[:2])
+    # Optional SPS edits
+    if nal_type(nal[:2]) == NAL_SPS:
+        nal2 = edit_sps_vui_if_requested(nal, cfg)
+        return start_code + nal2
+
+    ntype = nal_type(nal[:2])
     if ntype != NAL_SEI_PREFIX:
         return start_code + nal
 
     state["seen_sei_prefix"] = True
 
     nal_header = nal[:2]
-    rbsp = _ebsp_to_rbsp(nal[2:])
-    messages = _read_sei_messages(rbsp)
+    rbsp = ebsp_to_rbsp(nal[2:])
+    messages = read_sei_messages(rbsp)
 
     if not messages:
         return start_code + nal
@@ -473,55 +772,53 @@ def _process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, 
     had_cll = any(t == SEI_PAYLOAD_CLL for t, _ in messages)
 
     existing_mdcv = next((p for t, p in messages if t == SEI_PAYLOAD_MDCV), None)
+    existing_cll = next((p for t, p in messages if t == SEI_PAYLOAD_CLL), None)
 
     out = bytearray()
 
-    # Split: one SEI message per SEI prefix NAL (with optional stripping of payloadType=5)
+    # Split: one SEI message per SEI prefix NAL
     for t, p in messages:
+        # Optional strip of user_data_unregistered (encoder strings)
         if cfg.strip.strip_user_data and t == SEI_PAYLOAD_USER_DATA_UNREGISTERED:
-            if cfg.strip.user_data_match is None:
-                continue
-            try:
-                txt = p.decode("utf-8", "ignore")
-            except Exception:
-                txt = ""
-            if cfg.strip.user_data_match in txt:
-                continue
+            continue
 
         if t == SEI_PAYLOAD_MDCV:
-            payload = _apply_mdcv(p, cfg.mdcv)
+            payload = apply_mdcv(p, cfg.mdcv)
             state["mdcv"] = True
             one = [(SEI_PAYLOAD_MDCV, payload)]
         elif t == SEI_PAYLOAD_CLL:
-            payload = _apply_cll(cfg.cll)
+            payload = apply_cll(p, cfg.cll)
             state["cll"] = True
             one = [(SEI_PAYLOAD_CLL, payload)]
         else:
             one = [(t, p)]
 
-        new_rbsp = _encode_sei_messages(one)
-        new_ebsp = _rbsp_to_ebsp(new_rbsp)
+        new_rbsp = encode_sei_messages(one)
+        new_ebsp = rbsp_to_ebsp(new_rbsp)
         out += start_code + nal_header + new_ebsp
 
     # Insert missing MDCV/CLL right after this SEI prefix only once globally
     if (not state["mdcv"]) and (not had_mdcv):
-        payload = _apply_mdcv(existing_mdcv, cfg.mdcv)
-        out += start_code + nal_header + _rbsp_to_ebsp(_encode_sei_messages([(SEI_PAYLOAD_MDCV, payload)]))
+        payload = apply_mdcv(existing_mdcv, cfg.mdcv)
+        out += start_code + nal_header + rbsp_to_ebsp(encode_sei_messages([(SEI_PAYLOAD_MDCV, payload)]))
         state["mdcv"] = True
 
     if (not state["cll"]) and (not had_cll):
-        payload = _apply_cll(cfg.cll)
-        out += start_code + nal_header + _rbsp_to_ebsp(_encode_sei_messages([(SEI_PAYLOAD_CLL, payload)]))
+        payload = apply_cll(existing_cll, cfg.cll)
+        out += start_code + nal_header + rbsp_to_ebsp(encode_sei_messages([(SEI_PAYLOAD_CLL, payload)]))
         state["cll"] = True
 
-    # If everything got stripped and nothing was inserted, remove this SEI prefix NAL completely.
     if len(out) == 0:
         return b""
 
     return bytes(out)
 
 
-def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -> None:
+# ----------------------------
+# Raw processing (streaming)
+# ----------------------------
+
+def process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -> None:
     total_size: Optional[int] = None
     if input_path != "-" and os.path.exists(input_path):
         try:
@@ -529,7 +826,6 @@ def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -
         except OSError:
             total_size = None
 
-    # state flags
     state = {
         "mdcv": False,
         "cll": False,
@@ -540,9 +836,8 @@ def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -
     reader: Optional[CountingReader] = None
 
     if total_size is not None:
-        _print_progress(0)
+        print_progress(0)
 
-    # Use large chunks for Windows throughput
     chunk_size = 64 * 1024 * 1024
 
     if input_path == "-":
@@ -558,33 +853,30 @@ def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -
         out_f = open(output_path, "wb")
 
     try:
-        for sc_len, nal in _iter_annexb_nals_stream(in_f, chunk_size=chunk_size):
-            # progress
+        for sc_len, nal in iter_annexb_nals_stream(in_f, chunk_size=chunk_size):
             if total_size is not None and input_path != "-":
                 bytes_read = reader.bytes_read if reader is not None else 0
                 percent = int((bytes_read * 100) / total_size) if total_size > 0 else 100
                 if percent > 100:
                     percent = 100
                 if percent != last_percent:
-                    _print_progress(percent)
+                    print_progress(percent)
                     last_percent = percent
 
-            # If stream has *no* SEI prefix NALs at all, optionally insert right before first VCL.
+            # If the stream has no SEI prefix NALs at all, optionally insert before first VCL.
             if cfg.add_if_missing and (not state["seen_sei_prefix"]) and (not state["inserted_before_vcl"]) and len(nal) >= 2:
-                ntype = _nal_type(nal[:2])
-                if _is_vcl_nal_type(ntype):
-                    # Insert both SEIs before this first slice NAL.
-                    mdcv_payload = _apply_mdcv(None, cfg.mdcv)
-                    cll_payload = _apply_cll(cfg.cll)
-                    out_f.write(_make_single_sei_prefix_nal(sc_len, SEI_PAYLOAD_MDCV, mdcv_payload))
-                    out_f.write(_make_single_sei_prefix_nal(sc_len, SEI_PAYLOAD_CLL, cll_payload))
+                ntype = nal_type(nal[:2])
+                if is_vcl_nal_type(ntype):
+                    mdcv_payload = apply_mdcv(None, cfg.mdcv)
+                    cll_payload = apply_cll(None, cfg.cll)
+                    out_f.write(make_single_sei_prefix_nal(sc_len, SEI_PAYLOAD_MDCV, mdcv_payload))
+                    out_f.write(make_single_sei_prefix_nal(sc_len, SEI_PAYLOAD_CLL, cll_payload))
                     state["mdcv"] = True
                     state["cll"] = True
                     state["inserted_before_vcl"] = True
 
-            out_f.write(_process_one_nal(sc_len, nal, cfg, state))
+            out_f.write(process_one_nal(sc_len, nal, cfg, state))
 
-        # If we never saw a SEI prefix NAL and we did not insert before VCL, decide what to do.
         if not state["seen_sei_prefix"] and not state["inserted_before_vcl"]:
             if cfg.add_if_missing:
                 raise RuntimeError(
@@ -597,7 +889,7 @@ def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -
             )
 
         if total_size is not None and last_percent < 100:
-            _print_progress(100)
+            print_progress(100)
 
     finally:
         if input_path != "-":
@@ -606,8 +898,12 @@ def _process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) -
             out_f.close()
 
 
-def _process_container(input_path: str, output_path: str, cfg: EditConfig) -> None:
-    codec = _ffprobe_video_codec(input_path)
+# ----------------------------
+# Container processing (ffmpeg extract + remux)
+# ----------------------------
+
+def process_container(input_path: str, output_path: str, cfg: EditConfig) -> None:
+    codec = ffprobe_video_codec(input_path)
     if codec is None:
         raise RuntimeError("ffprobe could not read the input container.")
     if codec.lower() not in {"hevc", "h265"}:
@@ -622,7 +918,7 @@ def _process_container(input_path: str, output_path: str, cfg: EditConfig) -> No
 
         sys.stderr.write("Extracting HEVC bitstream with ffmpeg...\n")
         sys.stderr.flush()
-        _run([
+        run_cmd([
             "ffmpeg", "-y", "-v", "error",
             "-i", input_path,
             "-map", "0:v:0",
@@ -632,13 +928,13 @@ def _process_container(input_path: str, output_path: str, cfg: EditConfig) -> No
             extracted,
         ])
 
-        sys.stderr.write("Editing HDR10 SEI metadata...\n")
+        sys.stderr.write("Editing HEVC bitstream (HDR SEI + SPS VUI)...\n")
         sys.stderr.flush()
-        _process_raw_streaming(extracted, edited, cfg)
+        process_raw_streaming(extracted, edited, cfg)
 
         sys.stderr.write("Remuxing container with edited video stream...\n")
         sys.stderr.flush()
-        _run([
+        run_cmd([
             "ffmpeg", "-y", "-v", "error",
             "-i", input_path,
             "-i", edited,
@@ -651,116 +947,108 @@ def _process_container(input_path: str, output_path: str, cfg: EditConfig) -> No
         ])
 
 
+# ----------------------------
+# CLI / Config
+# ----------------------------
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Edit HDR10 metadata (MDCV+CLL) in HEVC. No JSON config required."
+        description="Edit HDR10 SEI (MDCV+CLL) and optional SPS VUI (Standard/Color range) in HEVC."
     )
-    parser.add_argument("-i", "--input", required=True, help="Input file: raw .hevc (Annex-B) or container (.mkv/.mp4/.mov/.m4v). Use '-' for stdin (raw only).")
-    parser.add_argument("-o", "--output", required=True, help="Output file. Use '-' for stdout (raw only).")
-    parser.add_argument("-p", "--preset", required=True, choices=["DisplayP3", "BT2020"], help='Preset to use: "DisplayP3" or "BT2020".')
-    parser.add_argument("--maxcll", type=int, default=1000, help="MaxCLL value (default: 1000).")
-    parser.add_argument("--maxfall", type=int, default=400, help="MaxFALL value (default: 400).")
-    parser.add_argument("--maxmdl", type=float, default=1000.0, help="Max mastering display luminance in nits (default: 1000).")
-    parser.add_argument("--minmdl", type=float, default=0.0001, help="Min mastering display luminance in nits (default: 0.0001).")
-    parser.add_argument("--write-json", default=None, help="If set, writes the generated HDR10 JSON metadata to this path (for inspection).")
+
+    parser.add_argument(
+        "-i", "--input", required=True,
+        help="Input file: raw .hevc (Annex-B) or container (.mkv/.mp4/.mov/.m4v). Use '-' for stdin (raw only)."
+    )
+    parser.add_argument(
+        "-o", "--output", required=True,
+        help="Output file. Use '-' for stdout (raw only)."
+    )
+
+    parser.add_argument(
+        "-p", "--preset", required=True, choices=["p3", "2020"],
+        help='HDR primaries preset: "p3" (Display P3 D65) or "2020" (BT.2020 D65).'
+    )
+
+    # No enforced defaults: only override if provided
+    parser.add_argument("-C", "--maxcll", type=int, default=None, help="MaxCLL value for HDR CLL (payloadType=144).")
+    parser.add_argument("-F", "--maxfall", type=int, default=None, help="MaxFALL value for HDR CLL (payloadType=144).")
+    parser.add_argument("-M", "--maxmdl", type=float, default=None, help="Max mastering display luminance (nits) for MDCV (payloadType=137).")
+    parser.add_argument("-m", "--minmdl", type=float, default=None, help="Min mastering display luminance (nits) for MDCV (payloadType=137).")
 
     add_group = parser.add_mutually_exclusive_group()
     add_group.add_argument(
-        "--add-if-missing",
-        dest="add_if_missing",
-        action="store_true",
-        help="If the stream has no SEI prefix NALs, insert MDCV+CLL before the first VCL NAL (default).",
+        "-a", "--add-if-missing", dest="add_if_missing", action="store_true",
+        help="If the stream has no SEI prefix NALs, insert MDCV+CLL before the first VCL NAL."
     )
     add_group.add_argument(
-        "--no-add-if-missing",
-        dest="add_if_missing",
-        action="store_false",
-        help="Disable insertion when a stream has no SEI prefix NALs (old behavior: error).",
+        "-A", "--no-add-if-missing", dest="add_if_missing", action="store_false",
+        help="Disable insertion when a stream has no SEI prefix NALs."
     )
     parser.set_defaults(add_if_missing=True)
 
     parser.add_argument(
-        "--strip-user-data",
-        action="store_true",
-        help="Remove SEI user_data_unregistered (payloadType=5) messages from SEI prefix NAL units.",
+        "-u", "--strip-user-data", action="store_true",
+        help="Remove SEI user_data_unregistered (payloadType=5) messages from SEI prefix NAL units."
+    )
+
+    # SPS VUI
+    parser.add_argument(
+        "-s", "--standard", default=None,
+        choices=["component", "pal", "ntsc", "secam", "mac", "unspec"],
+        help="Set SPS VUI video_format (MediaInfo 'Standard'). Use 'unspec' to remove NTSC/PAL labeling."
     )
     parser.add_argument(
-        "--strip-user-data-match",
-        default=None,
-        help="If set, only remove user_data_unregistered messages whose payload contains this UTF-8 substring "
-             "(e.g. 'Tencent-V265' or 'x265'). If omitted and --strip-user-data is set, removes all payloadType=5.",
+        "-r", "--range", default=None, choices=["limited", "full"],
+        help="Set SPS VUI video_full_range_flag (MediaInfo 'Color range')."
     )
 
     return parser
 
 
-def _build_cfg_from_args(args: argparse.Namespace) -> EditConfig:
+def build_cfg_from_args(args: argparse.Namespace) -> EditConfig:
+    preset_name = "DisplayP3" if args.preset == "p3" else "BT2020"
+
     mdcv = EditMdcv(
-        preset=args.preset,
-        max_display_mastering_luminance=float(args.maxmdl),
-        min_display_mastering_luminance=float(args.minmdl),
+        preset=preset_name,
+        max_display_mastering_luminance=args.maxmdl,
+        min_display_mastering_luminance=args.minmdl,
     )
     cll = EditCll(
-        max_content_light_level=int(args.maxcll),
-        max_average_light_level=int(args.maxfall),
+        max_content_light_level=args.maxcll,
+        max_average_light_level=args.maxfall,
     )
-    strip = EditStrip(
-        strip_user_data=bool(getattr(args, "strip_user_data", False)),
-        user_data_match=getattr(args, "strip_user_data_match", None),
+    strip = EditStrip(strip_user_data=bool(args.strip_user_data))
+
+    sps_standard = VIDEO_FORMAT_INV[args.standard] if args.standard is not None else None
+    sps_range = RANGE_INV[args.range] if args.range is not None else None
+    sps_vui = EditSpsVui(standard=sps_standard, full_range=sps_range)
+
+    return EditConfig(
+        mdcv=mdcv,
+        cll=cll,
+        add_if_missing=bool(args.add_if_missing),
+        strip=strip,
+        sps_vui=sps_vui,
     )
-    return EditConfig(mdcv=mdcv, cll=cll, add_if_missing=bool(args.add_if_missing), strip=strip)
-
-
-def _maybe_write_json(args: argparse.Namespace) -> None:
-    if not args.write_json:
-        return
-    prim = PRESET_PRIMARIES[args.preset]
-    cfg = {
-        "mdcv": {
-            "preset": args.preset,
-            "primaries": {
-                "display_primaries_x": list(prim["display_primaries_x"]),
-                "display_primaries_y": list(prim["display_primaries_y"]),
-                "white_point": list(prim["white_point"]),
-            },
-            "max_display_mastering_luminance": float(args.maxmdl),
-            "min_display_mastering_luminance": float(args.minmdl),
-        },
-        "cll": {
-            "max_content_light_level": int(args.maxcll),
-            "max_average_light_level": int(args.maxfall),
-        },
-        "add_if_missing": bool(args.add_if_missing),
-        "strip": {
-            "strip_user_data": bool(getattr(args, "strip_user_data", False)),
-            "user_data_match": getattr(args, "strip_user_data_match", None),
-        },
-    }
-    out_path = os.path.abspath(args.write_json)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4)
-    sys.stderr.write(f"JSON created: {out_path}\n")
-    sys.stderr.flush()
 
 
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    cfg = _build_cfg_from_args(args)
-    _maybe_write_json(args)
+    cfg = build_cfg_from_args(args)
 
     if args.input == "-":
-        _process_raw_streaming("-", args.output, cfg)
+        process_raw_streaming("-", args.output, cfg)
         return 0
 
-    if _is_container(args.input):
-        _process_container(args.input, args.output, cfg)
+    if is_container(args.input):
+        process_container(args.input, args.output, cfg)
     else:
-        _process_raw_streaming(args.input, args.output, cfg)
+        process_raw_streaming(args.input, args.output, cfg)
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
