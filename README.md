@@ -1,7 +1,15 @@
 ## hevc_hdr_editor (Python)
 
-Losslessly edit **HDR10 static metadata (MDCV + CLL)** in HEVC (H.265) video streams.
-Optionally remove embedded encoder / *“Writing library”* strings from the HEVC bitstream.
+Losslessly edit **HDR10 static metadata (MDCV + CLL)** and optional **SPS/VUI signaling** in HEVC (H.265) video streams.
+
+Supports:
+
+* Editing / inserting **MDCV (ST 2086)** and **CLL (MaxCLL/MaxFALL)** in **SEI prefix** NAL units
+* Editing SPS VUI flags that affect MediaInfo display:
+
+  * **Standard : NTSC/PAL/...** (SPS VUI `video_format`)
+  * **Color range : Limited/Full** (SPS VUI `video_full_range_flag`)
+* Optionally removing embedded encoder / *“Writing library”* strings (**SEI user_data_unregistered**, payloadType=5)
 
 ---
 
@@ -38,52 +46,48 @@ python hevc_hdr_editor.py -i INPUT -o OUTPUT -p PRESET [options]
 ## Required Arguments
 
 * `-i, --input`
-  Input file (raw HEVC or container)
+  Input file (raw HEVC or container). Use `-` for stdin (**raw HEVC only**).
 
 * `-o, --output`
-  Output file
-  (`-` allowed only for raw HEVC stdout)
+  Output file. Use `-` for stdout (**raw HEVC only**).
 
 * `-p, --preset`
-  HDR color primaries preset:
+  HDR primaries preset (short names):
 
-  * `DisplayP3`
-  * `BT2020`
+  * `p3`    (Display P3 D65)
+  * `2020`  (BT.2020 D65)
+
+> Note: The preset is used when writing/replacing **MDCV primaries + white point**.
 
 ---
 
 ## Optional Arguments
 
-### HDR10 Metadata
+### HDR10 Metadata (SEI)
 
-* `--maxcll <int>`
-  Maximum Content Light Level
-  *(default: 1000)*
+These options **override only what you provide** (no enforced defaults).
 
-* `--maxfall <int>`
-  Maximum Frame-Average Light Level
-  *(default: 400)*
+* `-C, --maxcll <int>`
+  Set **MaxCLL** (CLL SEI payloadType=144).
 
-* `--maxmdl <float>`
-  Max mastering display luminance (nits)
-  *(default: 1000.0)*
+* `-F, --maxfall <int>`
+  Set **MaxFALL** (CLL SEI payloadType=144).
 
-* `--minmdl <float>`
-  Min mastering display luminance (nits)
-  *(default: 0.0001)*
+* `-M, --maxmdl <float>`
+  Set **max mastering display luminance** in nits (MDCV SEI payloadType=137).
 
-* `--write-json <path>`
-  Write generated HDR10 metadata to a JSON file (inspection only)
+* `-m, --minmdl <float>`
+  Set **min mastering display luminance** in nits (MDCV SEI payloadType=137).
 
 ---
 
 ### SEI Handling
 
-* `--add-if-missing` *(default)*
+* `-a, --add-if-missing` *(default)*
   If **no SEI prefix NAL units exist**, insert MDCV + CLL **before the first VCL NAL**.
 
-* `--no-add-if-missing`
-  Disable insertion when no SEI prefix NAL units are found (error instead).
+* `-A, --no-add-if-missing`
+  Disable insertion when no SEI prefix NAL units are found.
 
 ---
 
@@ -91,57 +95,66 @@ python hevc_hdr_editor.py -i INPUT -o OUTPUT -p PRESET [options]
 
 These strings are usually stored as **SEI `user_data_unregistered` (payloadType=5)**.
 
-* `--strip-user-data`
-  Remove **all** `user_data_unregistered` SEI messages.
+* `-u, --strip-user-data`
+  Remove **all** `user_data_unregistered` SEI messages (payloadType=5).
 
-* `--strip-user-data-match "<substring>"`
-  Remove `user_data_unregistered` **only if** the payload contains the given text
-  (UTF-8 search, errors ignored).
+---
 
-> ⚠️ `--strip-user-data-match` **requires an argument** and should normally be used together with `--strip-user-data`.
+### SPS/VUI Signaling (MediaInfo “Standard” and “Color range”)
+
+These options modify **SPS VUI** signaling bits (they do **not** convert pixel values).
+
+* `-s, --standard <component|pal|ntsc|secam|mac|unspec>`
+  Set SPS VUI `video_format` (MediaInfo: **Standard**).
+  Use `unspec` to remove “Standard : NTSC” labeling.
+
+* `-r, --range <limited|full>`
+  Set SPS VUI `video_full_range_flag` (MediaInfo: **Color range**).
+
+> Warning: Changing `--range` only changes the *flag*. If the actual signal levels are not consistent, players may render incorrectly.
 
 ---
 
 ## Examples
 
-### Raw HEVC (HDR10 edit)
+### Raw HEVC: remove “Standard : NTSC” and force Full range flag
 
 ```console
-python hevc_hdr_editor.py -i video.hevc -o output.hevc -p BT2020 --maxcll 1200 --maxfall 500
+python hevc_hdr_editor.py -i video.hevc -o out.hevc -p 2020 -s unspec -r full
 ```
 
 ---
 
-### Raw HEVC + remove encoder string
-
-Remove any embedded *Writing library* / encoder metadata:
+### Raw HEVC: edit HDR10 CLL values
 
 ```console
-python hevc_hdr_editor.py -i video.hevc -o output.hevc -p DisplayP3 --strip-user-data
-```
-
-Remove only if it contains a specific string:
-
-```console
-python hevc_hdr_editor.py -i video.hevc -o output.hevc -p DisplayP3 --strip-user-data --strip-user-data-match "Tencent-V265"
+python hevc_hdr_editor.py -i video.hevc -o out.hevc -p 2020 -C 1200 -F 500
 ```
 
 ---
 
-### MKV / MP4 / MOV
+### Raw HEVC: remove encoder / “Writing library” strings
 
 ```console
-python hevc_hdr_editor.py -i input.mkv -o output.mkv -p DisplayP3
+python hevc_hdr_editor.py -i video.hevc -o out.hevc -p p3 -u
+```
+
+---
+
+### MKV / MP4 / MOV (container workflow)
+
+```console
+python hevc_hdr_editor.py -i input.mkv -o output.mkv -p p3 -s unspec
 ```
 
 ---
 
 ## Output Behavior
 
-* HDR10 metadata is **replaced or inserted**
-* Video stream is rewritten **losslessly**
-* SEI messages are rewritten safely
-* Progress is shown from **1% to 100%**
-* No re-encoding is performed
+* Video is rewritten **losslessly** (no re-encoding)
+* HDR10 metadata (MDCV/CLL) is **replaced or inserted** via SEI prefix NAL units
+* SPS VUI flags (Standard/Color range) are edited **in-place** when requested
+* Progress is shown from **1% to 100%** for raw inputs
+* Container inputs are processed via **ffmpeg extract → edit → remux**
 
 ---
