@@ -6,12 +6,20 @@ Edits HDR10 static metadata in HEVC (H.265) by replacing (or inserting) SEI pref
 - Mastering Display Colour Volume (MDCV / SMPTE ST 2086) payloadType = 137
 - Content Light Level (CLL / MaxCLL + MaxFALL)          payloadType = 144
 
-Also supports (optional) SPS/VUI edits that affect what MediaInfo shows as:
-- "Standard : NTSC"          -> SPS VUI video_format (3 bits)
+Also supports SPS/VUI edits that affect what MediaInfo shows as:
+- "Standard : NTSC"            -> SPS VUI video_format (3 bits)
 - "Color range : Limited/Full" -> SPS VUI video_full_range_flag (1 bit)
 
 Also supports (optional) removal of encoder strings:
 - Strip SEI user_data_unregistered (payloadType = 5), often used for "Writing library"/encoder tags.
+
+NEW: Simple "set/unset" of VUI colorimetry for SDR/HDR:
+- --set hdr   (or -S hdr): writes VUI colorimetry = BT.2020 / PQ / BT.2020 non-constant
+                           and forces HDR10 SEI (137/144) using -C/-F/-M/--minmdl
+- --set sdr   (or -S sdr): writes VUI colorimetry = BT.709 / BT.709 / BT.709
+                           and removes HDR10 SEI (137/144)
+- --unset hdr (or -U hdr): removes HDR10 SEI (137/144) AND removes VUI colorimetry
+- --unset sdr (or -U sdr): removes VUI colorimetry
 
 Supported inputs:
 1) Raw HEVC Annex-B elementary streams (start-code delimited)
@@ -21,8 +29,11 @@ CLI (short + long options):
   -i / --input        Input file (raw .hevc Annex-B OR container .mkv/.mp4/.mov/.m4v). Use '-' for stdin (raw only).
   -o / --output       Output file. Use '-' for stdout (raw only).
 
-  -p / --preset       HDR primaries preset: p3 or 2020
+  -p / --preset       MDCV primaries preset: p3 or 2020
                       (Used when writing/replacing MDCV primaries + white point.)
+                      NOTE: -p is required unless you use --set sdr / --unset sdr.
+                            For --set hdr, -p is required (to choose primaries preset).
+                            For --unset hdr, -p is NOT required.
 
   -C / --maxcll       MaxCLL value (nits) for CLL SEI (payloadType=144)
   -F / --maxfall      MaxFALL value (nits) for CLL SEI (payloadType=144)
@@ -44,10 +55,22 @@ CLI (short + long options):
   -r / --range        limited|full
       Set SPS VUI video_full_range_flag (MediaInfo "Color range").
 
+  -S / --set          hdr|sdr
+      Set signaling preset:
+        * hdr: VUI BT.2020/PQ/BT.2020 non-constant + force HDR10 SEI (137/144) per -C/-F/-M/--minmdl
+        * sdr: VUI BT.709/BT.709/BT.709 + remove HDR10 SEI (137/144)
+
+  -U / --unset        hdr|sdr
+      Unset signaling:
+        * hdr: remove HDR10 SEI (137/144) + remove VUI colorimetry
+        * sdr: remove VUI colorimetry
+
 Notes / Safety:
-- This tool performs signaling edits. Changing "Color range" flag does NOT convert pixel levels.
+- This tool performs signaling edits. Changing VUI flags does NOT convert pixels.
 - Streaming processing for raw input: does NOT load the entire file into memory (handles multi-GB files).
 - Progress is printed to STDERR (1%..100%) based on bytes read (raw input only).
+- VUI colorimetry insertion/removal is supported when video_signal_type_present_flag exists.
+  If video_signal_type_present_flag is absent, this script will leave VUI colorimetry unchanged.
 
 Container requirement:
 - ffmpeg + ffprobe must be available on PATH.
@@ -80,7 +103,16 @@ SEI_PAYLOAD_CLL = 144   # ContentLightLevel (MaxCLL/MaxFALL)
 D65_WHITEPOINT = (15635, 16450)
 MDL_FACTOR = 10000.0  # nits -> units of 0.0001 nits
 
-# Presets
+# VUI colour_primaries / transfer_characteristics / matrix_coeffs values (H.265)
+# Common values:
+#  - BT.709: cp=1, tc=1, mc=1
+#  - BT.2020: cp=9
+#  - PQ (SMPTE ST 2084): tc=16
+#  - BT.2020 non-constant matrix: mc=9
+VUI_BT709 = (1, 1, 1)
+VUI_HDR10_BT2020 = (9, 16, 9)
+
+# Presets for MDCV primaries/white point
 PRESET_PRIMARIES: Dict[str, Dict[str, Tuple[int, ...]]] = {
     "DisplayP3": {
         "display_primaries_x": (34000, 13250, 7500),
@@ -144,12 +176,31 @@ class EditSpsVui:
 
 
 @dataclass
+class ColorimetryMode:
+    # None => do not change VUI colorimetry
+    # "set_hdr" => set to BT.2020/PQ/BT.2020nc and ensure colour_description_present
+    # "set_sdr" => set to BT.709/BT.709/BT.709 and ensure colour_description_present
+    # "unset"   => remove colour_description_present and delete cp/tc/mc bytes if present
+    mode: Optional[str] = None
+
+
+@dataclass
+class HdrSeiMode:
+    # None => normal behavior (edit MDCV/CLL inside SEI prefix NALs; ensure present per SEI prefix)
+    # "remove" => remove HDR10 SEI (137/144) from SEI prefix NALs (do not insert)
+    # "force"  => ensure HDR10 SEI (137/144) presence per SEI prefix NAL and before first VCL if needed
+    mode: Optional[str] = None
+
+
+@dataclass
 class EditConfig:
     mdcv: EditMdcv
     cll: EditCll
     add_if_missing: bool
     strip: EditStrip
     sps_vui: EditSpsVui
+    colorimetry: ColorimetryMode
+    hdr_sei: HdrSeiMode
 
 
 class CountingReader:
@@ -384,7 +435,6 @@ def default_mdcv_fields(preset: str) -> Dict[str, object]:
 
 
 def apply_mdcv(existing_payload: Optional[bytes], cfg: EditMdcv) -> bytes:
-    # Start from existing if present, else from preset defaults
     fields = parse_mdcv(existing_payload) if existing_payload else default_mdcv_fields(cfg.preset)
 
     # Always set primaries/whitepoint to preset
@@ -403,13 +453,10 @@ def apply_mdcv(existing_payload: Optional[bytes], cfg: EditMdcv) -> bytes:
 
 
 def apply_cll(existing_payload: Optional[bytes], cfg: EditCll) -> bytes:
-    # If user did not provide both values, preserve existing if possible
     if cfg.max_content_light_level is None or cfg.max_average_light_level is None:
         if existing_payload is not None and len(existing_payload) >= 4:
             return existing_payload[:4]
-        # If missing and user didn't provide, insert 0/0 (valid but meaningless)
         return encode_cll(0, 0)
-
     return encode_cll(cfg.max_content_light_level, cfg.max_average_light_level)
 
 
@@ -503,7 +550,7 @@ def iter_annexb_nals_stream(f: BinaryIO, chunk_size: int = 64 * 1024 * 1024):
 
 
 # ----------------------------
-# SPS/VUI bit editing (Standard / Color range)
+# SPS/VUI bit parsing helpers
 # ----------------------------
 
 class BitReader:
@@ -598,10 +645,22 @@ def skip_short_term_ref_pic_set(br: BitReader, st_rps_idx: int, num_delta_pocs: 
 @dataclass
 class VuiLoc:
     ok: bool
+    # existing Standard / Range locations
     vf_bitpos: Optional[int] = None
     vf_val: Optional[int] = None
     vfr_bitpos: Optional[int] = None
     vfr_val: Optional[int] = None
+
+    # colorimetry in VUI (inside video_signal_type)
+    video_signal_type_present: bool = False
+    colour_desc_flag_bitpos: Optional[int] = None
+    colour_desc_flag_val: Optional[int] = None
+    colour_primaries_bitpos: Optional[int] = None
+    transfer_characteristics_bitpos: Optional[int] = None
+    matrix_coeffs_bitpos: Optional[int] = None
+    colour_primaries_val: Optional[int] = None
+    transfer_characteristics_val: Optional[int] = None
+    matrix_coeffs_val: Optional[int] = None
 
 
 def locate_vui_bits_in_sps(rbsp: bytes) -> VuiLoc:
@@ -671,15 +730,45 @@ def locate_vui_bits_in_sps(rbsp: bytes) -> VuiLoc:
 
     video_signal_type_present = bool(br.read_bool())
     if not video_signal_type_present:
-        return VuiLoc(ok=False)
+        # VUI exists, but no video_signal_type block
+        return VuiLoc(ok=True, video_signal_type_present=False)
 
+    # video_signal_type_present_flag == 1
     vf_bitpos = br.bitpos
     vf_val = br.read_bits(3)
 
     vfr_bitpos = br.bitpos
     vfr_val = br.read_bool()
 
-    return VuiLoc(ok=True, vf_bitpos=vf_bitpos, vf_val=vf_val, vfr_bitpos=vfr_bitpos, vfr_val=vfr_val)
+    # colour_description_present_flag
+    colour_desc_flag_bitpos = br.bitpos
+    colour_desc_flag_val = br.read_bool()
+
+    cp_bitpos = tc_bitpos = mc_bitpos = None
+    cp_val = tc_val = mc_val = None
+
+    if colour_desc_flag_val == 1:
+        cp_bitpos = br.bitpos
+        cp_val = br.read_bits(8)
+        tc_bitpos = br.bitpos
+        tc_val = br.read_bits(8)
+        mc_bitpos = br.bitpos
+        mc_val = br.read_bits(8)
+
+    return VuiLoc(
+        ok=True,
+        vf_bitpos=vf_bitpos, vf_val=vf_val,
+        vfr_bitpos=vfr_bitpos, vfr_val=vfr_val,
+        video_signal_type_present=True,
+        colour_desc_flag_bitpos=colour_desc_flag_bitpos,
+        colour_desc_flag_val=colour_desc_flag_val,
+        colour_primaries_bitpos=cp_bitpos,
+        transfer_characteristics_bitpos=tc_bitpos,
+        matrix_coeffs_bitpos=mc_bitpos,
+        colour_primaries_val=cp_val,
+        transfer_characteristics_val=tc_val,
+        matrix_coeffs_val=mc_val,
+    )
 
 
 def set_bits(rbsp: bytearray, bitpos: int, nbits: int, value: int) -> None:
@@ -695,13 +784,44 @@ def set_bits(rbsp: bytearray, bitpos: int, nbits: int, value: int) -> None:
             rbsp[byte_i] &= (~mask) & 0xFF
 
 
-def edit_sps_vui_if_requested(nal: bytes, cfg: EditConfig) -> bytes:
-    if (cfg.sps_vui.standard is None) and (cfg.sps_vui.full_range is None):
-        return nal
+def rbsp_to_bitlist(rbsp: bytes) -> List[int]:
+    bits: List[int] = []
+    for b in rbsp:
+        for i in range(7, -1, -1):
+            bits.append((b >> i) & 1)
+    return bits
 
+
+def bitlist_to_rbsp(bits: List[int]) -> bytes:
+    if len(bits) % 8 != 0:
+        # pad with zeros to full byte; rbsp_trailing_bits should already ensure validity
+        pad = 8 - (len(bits) % 8)
+        bits.extend([0] * pad)
+    out = bytearray()
+    for i in range(0, len(bits), 8):
+        v = 0
+        for j in range(8):
+            v = (v << 1) | (bits[i + j] & 1)
+        out.append(v & 0xFF)
+    return bytes(out)
+
+
+def set_byte_at_bitpos(bits: List[int], bitpos: int, value: int) -> None:
+    for i in range(8):
+        bits[bitpos + i] = (value >> (7 - i)) & 1
+
+
+def edit_vui_colorimetry_in_sps(nal: bytes, cfg: EditConfig) -> bytes:
+    """
+    Applies:
+    - cfg.sps_vui.standard / full_range (bit overwrite only)
+    - cfg.colorimetry mode (set_hdr/set_sdr/unset) with insertion/removal of cp/tc/mc when possible
+
+    Colorimetry insertion/removal is supported when video_signal_type_present_flag exists.
+    If video_signal_type_present_flag is absent, colorimetry mode is ignored.
+    """
     if len(nal) < 2:
         return nal
-
     if nal_type(nal[:2]) != NAL_SPS:
         return nal
 
@@ -711,29 +831,99 @@ def edit_sps_vui_if_requested(nal: bytes, cfg: EditConfig) -> bytes:
     try:
         loc = locate_vui_bits_in_sps(rbsp)
     except Exception:
-        # Unsupported SPS features: do not touch
         return nal
 
     if not loc.ok:
         return nal
 
     rb = bytearray(rbsp)
-    changed = False
+    changed_simple = False
 
+    # Simple bit overwrites (Standard / Range) when present
     if cfg.sps_vui.standard is not None and loc.vf_bitpos is not None and loc.vf_val is not None:
         if loc.vf_val != cfg.sps_vui.standard:
             set_bits(rb, loc.vf_bitpos, 3, cfg.sps_vui.standard)
-            changed = True
+            changed_simple = True
 
     if cfg.sps_vui.full_range is not None and loc.vfr_bitpos is not None and loc.vfr_val is not None:
         if loc.vfr_val != cfg.sps_vui.full_range:
             set_bits(rb, loc.vfr_bitpos, 1, cfg.sps_vui.full_range)
-            changed = True
+            changed_simple = True
 
-    if not changed:
-        return nal
+    rbsp_work = bytes(rb) if changed_simple else rbsp
 
-    return hdr + rbsp_to_ebsp(bytes(rb))
+    # Colorimetry edits (may require insertion/removal)
+    if cfg.colorimetry.mode is None:
+        if not changed_simple:
+            return nal
+        return hdr + rbsp_to_ebsp(rbsp_work)
+
+    # Need fresh loc after possible simple changes? Not strictly required for bit positions,
+    # but safe to re-locate.
+    try:
+        loc2 = locate_vui_bits_in_sps(rbsp_work)
+    except Exception:
+        return hdr + rbsp_to_ebsp(rbsp_work) if changed_simple else nal
+
+    if not loc2.ok or not loc2.video_signal_type_present:
+        # Cannot safely insert video_signal_type block here
+        return hdr + rbsp_to_ebsp(rbsp_work) if changed_simple else nal
+
+    if loc2.colour_desc_flag_bitpos is None or loc2.colour_desc_flag_val is None:
+        return hdr + rbsp_to_ebsp(rbsp_work) if changed_simple else nal
+
+    bits = rbsp_to_bitlist(rbsp_work)
+
+    def ensure_colour_desc_and_set(cp: int, tc: int, mc: int) -> None:
+        flag_pos = loc2.colour_desc_flag_bitpos
+        assert flag_pos is not None
+        flag_val = loc2.colour_desc_flag_val
+
+        if flag_val == 1:
+            # overwrite existing 3 bytes
+            if loc2.colour_primaries_bitpos is not None:
+                set_byte_at_bitpos(bits, loc2.colour_primaries_bitpos, cp)
+            if loc2.transfer_characteristics_bitpos is not None:
+                set_byte_at_bitpos(bits, loc2.transfer_characteristics_bitpos, tc)
+            if loc2.matrix_coeffs_bitpos is not None:
+                set_byte_at_bitpos(bits, loc2.matrix_coeffs_bitpos, mc)
+            return
+
+        # flag_val == 0: flip to 1 and insert 24 bits (3 bytes) right after the flag bit
+        bits[flag_pos] = 1
+        insert_at = flag_pos + 1
+        ins = []
+        for v in (cp, tc, mc):
+            for i in range(7, -1, -1):
+                ins.append((v >> i) & 1)
+        bits[insert_at:insert_at] = ins
+
+    def remove_colour_desc() -> None:
+        flag_pos = loc2.colour_desc_flag_bitpos
+        assert flag_pos is not None
+        flag_val = loc2.colour_desc_flag_val
+        if flag_val == 0:
+            return
+        # set flag to 0 and delete next 24 bits
+        bits[flag_pos] = 0
+        del_at = flag_pos + 1
+        del bits[del_at:del_at + 24]
+
+    mode = cfg.colorimetry.mode
+    if mode == "set_hdr":
+        cp, tc, mc = VUI_HDR10_BT2020
+        ensure_colour_desc_and_set(cp, tc, mc)
+    elif mode == "set_sdr":
+        cp, tc, mc = VUI_BT709
+        ensure_colour_desc_and_set(cp, tc, mc)
+    elif mode == "unset":
+        remove_colour_desc()
+    else:
+        # unknown
+        return hdr + rbsp_to_ebsp(rbsp_work) if changed_simple else nal
+
+    new_rbsp = bitlist_to_rbsp(bits)
+    return hdr + rbsp_to_ebsp(new_rbsp)
 
 
 # ----------------------------
@@ -743,21 +933,20 @@ def edit_sps_vui_if_requested(nal: bytes, cfg: EditConfig) -> bytes:
 def process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, bool]) -> bytes:
     """
     Returns bytes to write for this NAL, including its start code.
-    Applies optional SPS edits (Standard/Range) and SEI HDR edits.
 
-    IMPORTANT FIX:
-    - MDCV/CLL insertion is done per SEI prefix NAL, not globally once per stream.
-      This prevents HDR metadata from "disappearing" mid-stream when later SEI prefix NALs
-      lack MDCV/CLL payloads.
+    IMPORTANT FIX (retained):
+    - MDCV/CLL insertion is done per SEI prefix NAL, not once per stream,
+      preventing metadata from "disappearing" mid-stream when later SEI prefix NALs
+      lack MDCV/CLL.
     """
     start_code = b"\x00\x00\x01" if sc_len == 3 else b"\x00\x00\x00\x01"
 
     if len(nal) < 2:
         return start_code + nal
 
-    # Optional SPS edits
+    # SPS edits (Standard/Range + Colorimetry set/unset)
     if nal_type(nal[:2]) == NAL_SPS:
-        nal2 = edit_sps_vui_if_requested(nal, cfg)
+        nal2 = edit_vui_colorimetry_in_sps(nal, cfg)
         return start_code + nal2
 
     ntype = nal_type(nal[:2])
@@ -773,6 +962,18 @@ def process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, b
     if not messages:
         return start_code + nal
 
+    # If we're explicitly removing HDR10 SEI (unset hdr / set sdr), drop 137/144 and DO NOT insert.
+    if cfg.hdr_sei.mode == "remove":
+        out = bytearray()
+        for t, p in messages:
+            if cfg.strip.strip_user_data and t == SEI_PAYLOAD_USER_DATA_UNREGISTERED:
+                continue
+            if t in (SEI_PAYLOAD_MDCV, SEI_PAYLOAD_CLL):
+                continue
+            new_rbsp = encode_sei_messages([(t, p)])
+            out += start_code + nal_header + rbsp_to_ebsp(new_rbsp)
+        return bytes(out) if out else b""
+
     had_mdcv = any(t == SEI_PAYLOAD_MDCV for t, _ in messages)
     had_cll = any(t == SEI_PAYLOAD_CLL for t, _ in messages)
 
@@ -783,7 +984,6 @@ def process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, b
 
     # Split: one SEI message per SEI prefix NAL
     for t, p in messages:
-        # Optional strip of user_data_unregistered (encoder strings)
         if cfg.strip.strip_user_data and t == SEI_PAYLOAD_USER_DATA_UNREGISTERED:
             continue
 
@@ -797,23 +997,19 @@ def process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, b
             one = [(t, p)]
 
         new_rbsp = encode_sei_messages(one)
-        new_ebsp = rbsp_to_ebsp(new_rbsp)
-        out += start_code + nal_header + new_ebsp
+        out += start_code + nal_header + rbsp_to_ebsp(new_rbsp)
 
-    # FIX: Ensure MDCV/CLL presence for THIS SEI prefix NAL whenever missing.
-    # This is no longer "only once globally".
-    if not had_mdcv:
-        payload = apply_mdcv(existing_mdcv, cfg.mdcv)
-        out += start_code + nal_header + rbsp_to_ebsp(encode_sei_messages([(SEI_PAYLOAD_MDCV, payload)]))
+    # Ensure MDCV/CLL presence for THIS SEI prefix NAL whenever missing,
+    # unless the caller wants to "not force" (we keep this always-on for normal and force modes).
+    if cfg.hdr_sei.mode in (None, "force"):
+        if not had_mdcv:
+            payload = apply_mdcv(existing_mdcv, cfg.mdcv)
+            out += start_code + nal_header + rbsp_to_ebsp(encode_sei_messages([(SEI_PAYLOAD_MDCV, payload)]))
+        if not had_cll:
+            payload = apply_cll(existing_cll, cfg.cll)
+            out += start_code + nal_header + rbsp_to_ebsp(encode_sei_messages([(SEI_PAYLOAD_CLL, payload)]))
 
-    if not had_cll:
-        payload = apply_cll(existing_cll, cfg.cll)
-        out += start_code + nal_header + rbsp_to_ebsp(encode_sei_messages([(SEI_PAYLOAD_CLL, payload)]))
-
-    if len(out) == 0:
-        return b""
-
-    return bytes(out)
+    return bytes(out) if out else b""
 
 
 # ----------------------------
@@ -863,8 +1059,15 @@ def process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) ->
                     print_progress(percent)
                     last_percent = percent
 
-            # If the stream has no SEI prefix NALs at all, optionally insert before first VCL.
-            if cfg.add_if_missing and (not state["seen_sei_prefix"]) and (not state["inserted_before_vcl"]) and len(nal) >= 2:
+            # If the stream has no SEI prefix NALs at all, optionally insert before first VCL NAL.
+            # Only when we are not in "remove HDR SEI" mode.
+            if (
+                cfg.add_if_missing
+                and cfg.hdr_sei.mode != "remove"
+                and (not state["seen_sei_prefix"])
+                and (not state["inserted_before_vcl"])
+                and len(nal) >= 2
+            ):
                 ntype = nal_type(nal[:2])
                 if is_vcl_nal_type(ntype):
                     mdcv_payload = apply_mdcv(None, cfg.mdcv)
@@ -876,15 +1079,18 @@ def process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) ->
             out_f.write(process_one_nal(sc_len, nal, cfg, state))
 
         if not state["seen_sei_prefix"] and not state["inserted_before_vcl"]:
-            if cfg.add_if_missing:
+            if cfg.add_if_missing and cfg.hdr_sei.mode != "remove":
                 raise RuntimeError(
                     "No VCL NAL units were found to anchor insertion (unexpected/invalid stream). "
                     "HDR metadata could not be inserted."
                 )
-            raise RuntimeError(
-                "No SEI Prefix NAL units were found, so HDR metadata could not be inserted. "
-                "Re-run with --add-if-missing to insert MDCV/CLL before the first VCL NAL."
-            )
+            # If removing HDR SEI, it's normal that we don't need SEI.
+            # Otherwise, keep original behavior.
+            if cfg.hdr_sei.mode != "remove":
+                raise RuntimeError(
+                    "No SEI Prefix NAL units were found, so HDR metadata could not be inserted. "
+                    "Re-run with --add-if-missing to insert MDCV/CLL before the first VCL NAL."
+                )
 
         if total_size is not None and last_percent < 100:
             print_progress(100)
@@ -926,7 +1132,7 @@ def process_container(input_path: str, output_path: str, cfg: EditConfig) -> Non
             extracted,
         ])
 
-        sys.stderr.write("Editing HEVC bitstream (HDR SEI + SPS VUI)...\n")
+        sys.stderr.write("Editing HEVC bitstream...\n")
         sys.stderr.flush()
         process_raw_streaming(extracted, edited, cfg)
 
@@ -951,7 +1157,7 @@ def process_container(input_path: str, output_path: str, cfg: EditConfig) -> Non
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Edit HDR10 SEI (MDCV+CLL) and optional SPS VUI (Standard/Color range) in HEVC."
+        description="Edit HDR10 SEI (MDCV+CLL) and SPS/VUI signaling (Standard/Range/Colorimetry) in HEVC."
     )
 
     parser.add_argument(
@@ -963,13 +1169,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Output file. Use '-' for stdout (raw only)."
     )
 
+    # PRESET IS NOW OPTIONAL (required only in some modes)
     parser.add_argument(
-        "-p", "--preset", required=True, choices=["p3", "2020"],
-        help='HDR primaries preset: "p3" (Display P3 D65) or "2020" (BT.2020 D65).'
+        "-p", "--preset", default=None, choices=["p3", "2020"],
+        help='MDCV primaries preset: "p3" (Display P3 D65) or "2020" (BT.2020 D65). Required only when writing MDCV (e.g. -S hdr).'
     )
 
-    parser.add_argument("-C", "--maxcll", type=int, default=None, help="MaxCLL value for HDR CLL (payloadType=144).")
-    parser.add_argument("-F", "--maxfall", type=int, default=None, help="MaxFALL value for HDR CLL (payloadType=144).")
+    parser.add_argument("-C", "--maxcll", type=int, default=None, help="MaxCLL for HDR CLL (payloadType=144).")
+    parser.add_argument("-F", "--maxfall", type=int, default=None, help="MaxFALL for HDR CLL (payloadType=144).")
     parser.add_argument("-M", "--maxmdl", type=float, default=None, help="Max mastering display luminance (nits) for MDCV (payloadType=137).")
     parser.add_argument("-m", "--minmdl", type=float, default=None, help="Min mastering display luminance (nits) for MDCV (payloadType=137).")
 
@@ -986,10 +1193,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "-u", "--strip-user-data", action="store_true",
-        help="Remove SEI user_data_unregistered (payloadType=5) messages from SEI prefix NAL units."
+        help="Remove SEI user_data_unregistered (payloadType=5) from SEI prefix NALs."
     )
 
-    # SPS VUI
+    # Existing SPS VUI edits
     parser.add_argument(
         "-s", "--standard", default=None,
         choices=["component", "pal", "ntsc", "secam", "mac", "unspec"],
@@ -1000,10 +1207,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Set SPS VUI video_full_range_flag (MediaInfo 'Color range')."
     )
 
+    # New set/unset
+    parser.add_argument(
+        "-S", "--set", dest="set_mode", default=None, choices=["hdr", "sdr"],
+        help='Set signaling preset: "hdr" (VUI BT.2020/PQ/BT.2020nc + force HDR10 SEI) or "sdr" (VUI BT.709/BT.709/BT.709 + remove HDR10 SEI).'
+    )
+    parser.add_argument(
+        "-U", "--unset", dest="unset_mode", default=None, choices=["hdr", "sdr"],
+        help='Unset signaling: "hdr" (remove HDR10 SEI + remove VUI colorimetry) or "sdr" (remove VUI colorimetry).'
+    )
+
     return parser
 
 
 def build_cfg_from_args(args: argparse.Namespace) -> EditConfig:
+    # preset is now optional; validated in main() depending on requested operation
     preset_name = "DisplayP3" if args.preset == "p3" else "BT2020"
 
     mdcv = EditMdcv(
@@ -1021,18 +1239,54 @@ def build_cfg_from_args(args: argparse.Namespace) -> EditConfig:
     sps_range = RANGE_INV[args.range] if args.range is not None else None
     sps_vui = EditSpsVui(standard=sps_standard, full_range=sps_range)
 
+    # Decide modes (unset has priority over set if both given)
+    colorimetry = ColorimetryMode(mode=None)
+    hdr_sei = HdrSeiMode(mode=None)
+
+    if args.unset_mode is not None:
+        # Unset always removes VUI colorimetry
+        colorimetry.mode = "unset"
+        if args.unset_mode == "hdr":
+            hdr_sei.mode = "remove"  # remove HDR10 SEI too
+    elif args.set_mode is not None:
+        if args.set_mode == "hdr":
+            colorimetry.mode = "set_hdr"
+            hdr_sei.mode = "force"
+        elif args.set_mode == "sdr":
+            colorimetry.mode = "set_sdr"
+            hdr_sei.mode = "remove"  # SDR preset removes HDR10 SEI
+
     return EditConfig(
         mdcv=mdcv,
         cll=cll,
         add_if_missing=bool(args.add_if_missing),
         strip=strip,
         sps_vui=sps_vui,
+        colorimetry=colorimetry,
+        hdr_sei=hdr_sei,
     )
 
 
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    # Require --preset only when we will write/force MDCV (HDR10 ST2086)
+    needs_preset = False
+
+    if args.set_mode == "hdr":
+        needs_preset = True
+
+    # If user explicitly provides MDCV luminance overrides, we must be able to build MDCV.
+    if args.maxmdl is not None or args.minmdl is not None:
+        needs_preset = True
+
+    # Legacy path: if neither -S nor -U is used, the tool's HDR SEI editing path requires a preset.
+    if args.set_mode is None and args.unset_mode is None:
+        needs_preset = True
+
+    if needs_preset and args.preset is None:
+        parser.error("the following arguments are required: -p/--preset (required when writing MDCV/HDR primaries, e.g. -S hdr)")
 
     cfg = build_cfg_from_args(args)
 
