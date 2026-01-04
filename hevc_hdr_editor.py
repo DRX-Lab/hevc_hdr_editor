@@ -744,6 +744,11 @@ def process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, b
     """
     Returns bytes to write for this NAL, including its start code.
     Applies optional SPS edits (Standard/Range) and SEI HDR edits.
+
+    IMPORTANT FIX:
+    - MDCV/CLL insertion is done per SEI prefix NAL, not globally once per stream.
+      This prevents HDR metadata from "disappearing" mid-stream when later SEI prefix NALs
+      lack MDCV/CLL payloads.
     """
     start_code = b"\x00\x00\x01" if sc_len == 3 else b"\x00\x00\x00\x01"
 
@@ -784,11 +789,9 @@ def process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, b
 
         if t == SEI_PAYLOAD_MDCV:
             payload = apply_mdcv(p, cfg.mdcv)
-            state["mdcv"] = True
             one = [(SEI_PAYLOAD_MDCV, payload)]
         elif t == SEI_PAYLOAD_CLL:
             payload = apply_cll(p, cfg.cll)
-            state["cll"] = True
             one = [(SEI_PAYLOAD_CLL, payload)]
         else:
             one = [(t, p)]
@@ -797,16 +800,15 @@ def process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, b
         new_ebsp = rbsp_to_ebsp(new_rbsp)
         out += start_code + nal_header + new_ebsp
 
-    # Insert missing MDCV/CLL right after this SEI prefix only once globally
-    if (not state["mdcv"]) and (not had_mdcv):
+    # FIX: Ensure MDCV/CLL presence for THIS SEI prefix NAL whenever missing.
+    # This is no longer "only once globally".
+    if not had_mdcv:
         payload = apply_mdcv(existing_mdcv, cfg.mdcv)
         out += start_code + nal_header + rbsp_to_ebsp(encode_sei_messages([(SEI_PAYLOAD_MDCV, payload)]))
-        state["mdcv"] = True
 
-    if (not state["cll"]) and (not had_cll):
+    if not had_cll:
         payload = apply_cll(existing_cll, cfg.cll)
         out += start_code + nal_header + rbsp_to_ebsp(encode_sei_messages([(SEI_PAYLOAD_CLL, payload)]))
-        state["cll"] = True
 
     if len(out) == 0:
         return b""
@@ -827,8 +829,6 @@ def process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) ->
             total_size = None
 
     state = {
-        "mdcv": False,
-        "cll": False,
         "seen_sei_prefix": False,
         "inserted_before_vcl": False,
     }
@@ -871,8 +871,6 @@ def process_raw_streaming(input_path: str, output_path: str, cfg: EditConfig) ->
                     cll_payload = apply_cll(None, cfg.cll)
                     out_f.write(make_single_sei_prefix_nal(sc_len, SEI_PAYLOAD_MDCV, mdcv_payload))
                     out_f.write(make_single_sei_prefix_nal(sc_len, SEI_PAYLOAD_CLL, cll_payload))
-                    state["mdcv"] = True
-                    state["cll"] = True
                     state["inserted_before_vcl"] = True
 
             out_f.write(process_one_nal(sc_len, nal, cfg, state))
@@ -970,7 +968,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help='HDR primaries preset: "p3" (Display P3 D65) or "2020" (BT.2020 D65).'
     )
 
-    # No enforced defaults: only override if provided
     parser.add_argument("-C", "--maxcll", type=int, default=None, help="MaxCLL value for HDR CLL (payloadType=144).")
     parser.add_argument("-F", "--maxfall", type=int, default=None, help="MaxFALL value for HDR CLL (payloadType=144).")
     parser.add_argument("-M", "--maxmdl", type=float, default=None, help="Max mastering display luminance (nits) for MDCV (payloadType=137).")
@@ -1049,6 +1046,7 @@ def main() -> int:
         process_raw_streaming(args.input, args.output, cfg)
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
