@@ -21,6 +21,13 @@ NEW: Simple "set/unset" of VUI colorimetry for SDR/HDR:
 - --unset hdr (or -U hdr): removes HDR10 SEI (137/144) AND removes VUI colorimetry
 - --unset sdr (or -U sdr): removes VUI colorimetry
 
+NEW: Set/unset VUI chroma sample location ("Type N" shown by MediaInfo for 4:2:0 etc.):
+- --chroma-loc N (or -c N): sets chroma_loc_info_present_flag=1 and writes
+                            chroma_sample_loc_type_top_field/bottom_field = N (ue(v))
+                            If chroma_loc_info is absent, inserts it into VUI (requires VUI present).
+- --unset-chroma-loc (or -x): clears chroma_loc_info_present_flag and removes the two ue(v) values
+                              so MediaInfo typically shows only "4:2:0" without "(Type N)".
+
 Supported inputs:
 1) Raw HEVC Annex-B elementary streams (start-code delimited)
 2) Matroska / MP4 / MOV containers (via ffmpeg extract + remux)
@@ -55,6 +62,12 @@ CLI (short + long options):
   -r / --range        limited|full
       Set SPS VUI video_full_range_flag (MediaInfo "Color range").
 
+  -c / --chroma-loc   N
+      Set VUI chroma sample location ("Type N" in MediaInfo) to N.
+
+  -x / --unset-chroma-loc
+      Remove VUI chroma sample location info (so MediaInfo shows no "(Type N)").
+
   -S / --set          hdr|sdr
       Set signaling preset:
         * hdr: VUI BT.2020/PQ/BT.2020 non-constant + force HDR10 SEI (137/144) per -C/-F/-M/--minmdl
@@ -71,6 +84,8 @@ Notes / Safety:
 - Progress is printed to STDERR (1%..100%) based on bytes read (raw input only).
 - VUI colorimetry insertion/removal is supported when video_signal_type_present_flag exists.
   If video_signal_type_present_flag is absent, this script will leave VUI colorimetry unchanged.
+- VUI chroma_loc insertion/removal requires VUI to exist. If vui_parameters_present_flag is absent,
+  this script will leave chroma_loc unchanged.
 
 Container requirement:
 - ffmpeg + ffprobe must be available on PATH.
@@ -173,6 +188,10 @@ class EditStrip:
 class EditSpsVui:
     standard: Optional[int]      # video_format (0..7)
     full_range: Optional[int]    # video_full_range_flag (0/1)
+
+    # MediaInfo "Chroma subsampling ... (Type N)" is derived from VUI chroma_loc_info.
+    chroma_loc: Optional[int]    # chroma_sample_loc_type_top_field/bottom_field ue(v)
+    unset_chroma_loc: bool       # remove chroma_loc_info_present_flag and associated ue(v)
 
 
 @dataclass
@@ -662,6 +681,18 @@ class VuiLoc:
     transfer_characteristics_val: Optional[int] = None
     matrix_coeffs_val: Optional[int] = None
 
+    # chroma sample location (MediaInfo "Chroma subsampling ... (Type N)")
+    chroma_loc_info_present_bitpos: Optional[int] = None
+    chroma_loc_info_present_val: Optional[int] = None
+
+    chroma_top_ue_start: Optional[int] = None
+    chroma_top_ue_end: Optional[int] = None
+    chroma_bottom_ue_start: Optional[int] = None
+    chroma_bottom_ue_end: Optional[int] = None
+
+    chroma_top_val: Optional[int] = None
+    chroma_bottom_val: Optional[int] = None
+
 
 def locate_vui_bits_in_sps(rbsp: bytes) -> VuiLoc:
     br = BitReader(rbsp)
@@ -728,38 +759,56 @@ def locate_vui_bits_in_sps(rbsp: bytes) -> VuiLoc:
     if br.read_bool():
         br.read_bool()
 
+    # video_signal_type_present_flag
     video_signal_type_present = bool(br.read_bool())
-    if not video_signal_type_present:
-        # VUI exists, but no video_signal_type block
-        return VuiLoc(ok=True, video_signal_type_present=False)
 
-    # video_signal_type_present_flag == 1
-    vf_bitpos = br.bitpos
-    vf_val = br.read_bits(3)
-
-    vfr_bitpos = br.bitpos
-    vfr_val = br.read_bool()
-
-    # colour_description_present_flag
-    colour_desc_flag_bitpos = br.bitpos
-    colour_desc_flag_val = br.read_bool()
-
+    vf_bitpos = vf_val = None
+    vfr_bitpos = vfr_val = None
+    colour_desc_flag_bitpos = colour_desc_flag_val = None
     cp_bitpos = tc_bitpos = mc_bitpos = None
     cp_val = tc_val = mc_val = None
 
-    if colour_desc_flag_val == 1:
-        cp_bitpos = br.bitpos
-        cp_val = br.read_bits(8)
-        tc_bitpos = br.bitpos
-        tc_val = br.read_bits(8)
-        mc_bitpos = br.bitpos
-        mc_val = br.read_bits(8)
+    if video_signal_type_present:
+        vf_bitpos = br.bitpos
+        vf_val = br.read_bits(3)
+
+        vfr_bitpos = br.bitpos
+        vfr_val = br.read_bool()
+
+        colour_desc_flag_bitpos = br.bitpos
+        colour_desc_flag_val = br.read_bool()
+
+        if colour_desc_flag_val == 1:
+            cp_bitpos = br.bitpos
+            cp_val = br.read_bits(8)
+            tc_bitpos = br.bitpos
+            tc_val = br.read_bits(8)
+            mc_bitpos = br.bitpos
+            mc_val = br.read_bits(8)
+
+    # chroma_loc_info_present_flag (exists regardless of video_signal_type_present_flag)
+    chroma_loc_info_present_bitpos = br.bitpos
+    chroma_loc_info_present_val = br.read_bool()
+
+    chroma_top_ue_start = chroma_top_ue_end = None
+    chroma_bottom_ue_start = chroma_bottom_ue_end = None
+    chroma_top_val = chroma_bottom_val = None
+
+    if chroma_loc_info_present_val == 1:
+        chroma_top_ue_start = br.bitpos
+        chroma_top_val = br.read_ue()
+        chroma_top_ue_end = br.bitpos
+
+        chroma_bottom_ue_start = br.bitpos
+        chroma_bottom_val = br.read_ue()
+        chroma_bottom_ue_end = br.bitpos
 
     return VuiLoc(
         ok=True,
         vf_bitpos=vf_bitpos, vf_val=vf_val,
         vfr_bitpos=vfr_bitpos, vfr_val=vfr_val,
-        video_signal_type_present=True,
+        video_signal_type_present=video_signal_type_present,
+
         colour_desc_flag_bitpos=colour_desc_flag_bitpos,
         colour_desc_flag_val=colour_desc_flag_val,
         colour_primaries_bitpos=cp_bitpos,
@@ -768,6 +817,15 @@ def locate_vui_bits_in_sps(rbsp: bytes) -> VuiLoc:
         colour_primaries_val=cp_val,
         transfer_characteristics_val=tc_val,
         matrix_coeffs_val=mc_val,
+
+        chroma_loc_info_present_bitpos=chroma_loc_info_present_bitpos,
+        chroma_loc_info_present_val=chroma_loc_info_present_val,
+        chroma_top_ue_start=chroma_top_ue_start,
+        chroma_top_ue_end=chroma_top_ue_end,
+        chroma_bottom_ue_start=chroma_bottom_ue_start,
+        chroma_bottom_ue_end=chroma_bottom_ue_end,
+        chroma_top_val=chroma_top_val,
+        chroma_bottom_val=chroma_bottom_val,
     )
 
 
@@ -811,14 +869,33 @@ def set_byte_at_bitpos(bits: List[int], bitpos: int, value: int) -> None:
         bits[bitpos + i] = (value >> (7 - i)) & 1
 
 
+def ue_to_bits(v: int) -> List[int]:
+    """
+    Encodes unsigned Exp-Golomb ue(v) into a list of bits.
+    """
+    if v < 0:
+        raise ValueError("ue_to_bits: negative value")
+    code_num = v + 1
+    k = code_num.bit_length() - 1  # floor(log2(code_num))
+    prefix = [0] * k + [1]
+    info_val = code_num - (1 << k)
+    info = []
+    for i in range(k - 1, -1, -1):
+        info.append((info_val >> i) & 1)
+    return prefix + info
+
+
 def edit_vui_colorimetry_in_sps(nal: bytes, cfg: EditConfig) -> bytes:
     """
     Applies:
     - cfg.sps_vui.standard / full_range (bit overwrite only)
     - cfg.colorimetry mode (set_hdr/set_sdr/unset) with insertion/removal of cp/tc/mc when possible
+    - cfg.sps_vui.chroma_loc / unset_chroma_loc (set/unset chroma_loc_info_present + two ue(v) values)
 
     Colorimetry insertion/removal is supported when video_signal_type_present_flag exists.
     If video_signal_type_present_flag is absent, colorimetry mode is ignored.
+
+    Chroma location insertion/removal requires VUI to exist. If VUI is absent, no change is made.
     """
     if len(nal) < 2:
         return nal
@@ -852,78 +929,166 @@ def edit_vui_colorimetry_in_sps(nal: bytes, cfg: EditConfig) -> bytes:
 
     rbsp_work = bytes(rb) if changed_simple else rbsp
 
-    # Colorimetry edits (may require insertion/removal)
-    if cfg.colorimetry.mode is None:
+    want_chroma_loc = (cfg.sps_vui.chroma_loc is not None) or cfg.sps_vui.unset_chroma_loc
+
+    # If no variable-length edits requested, return quickly
+    if cfg.colorimetry.mode is None and not want_chroma_loc:
         if not changed_simple:
             return nal
         return hdr + rbsp_to_ebsp(rbsp_work)
 
-    # Need fresh loc after possible simple changes? Not strictly required for bit positions,
-    # but safe to re-locate.
+    # ----------------------------
+    # Apply colorimetry edits first (because they can shift bit positions)
+    # ----------------------------
+    rbsp_after_colorimetry = rbsp_work
+
+    if cfg.colorimetry.mode is not None:
+        try:
+            loc2 = locate_vui_bits_in_sps(rbsp_work)
+        except Exception:
+            return hdr + rbsp_to_ebsp(rbsp_work) if changed_simple else nal
+
+        if not loc2.ok or not loc2.video_signal_type_present:
+            # Cannot safely insert video_signal_type block here
+            rbsp_after_colorimetry = rbsp_work
+        elif loc2.colour_desc_flag_bitpos is None or loc2.colour_desc_flag_val is None:
+            rbsp_after_colorimetry = rbsp_work
+        else:
+            bits = rbsp_to_bitlist(rbsp_work)
+
+            def ensure_colour_desc_and_set(cp: int, tc: int, mc: int) -> None:
+                flag_pos = loc2.colour_desc_flag_bitpos
+                assert flag_pos is not None
+                flag_val = loc2.colour_desc_flag_val
+
+                if flag_val == 1:
+                    # overwrite existing 3 bytes
+                    if loc2.colour_primaries_bitpos is not None:
+                        set_byte_at_bitpos(bits, loc2.colour_primaries_bitpos, cp)
+                    if loc2.transfer_characteristics_bitpos is not None:
+                        set_byte_at_bitpos(bits, loc2.transfer_characteristics_bitpos, tc)
+                    if loc2.matrix_coeffs_bitpos is not None:
+                        set_byte_at_bitpos(bits, loc2.matrix_coeffs_bitpos, mc)
+                    return
+
+                # flag_val == 0: flip to 1 and insert 24 bits (3 bytes) right after the flag bit
+                bits[flag_pos] = 1
+                insert_at = flag_pos + 1
+                ins = []
+                for v in (cp, tc, mc):
+                    for i in range(7, -1, -1):
+                        ins.append((v >> i) & 1)
+                bits[insert_at:insert_at] = ins
+
+            def remove_colour_desc() -> None:
+                flag_pos = loc2.colour_desc_flag_bitpos
+                assert flag_pos is not None
+                flag_val = loc2.colour_desc_flag_val
+                if flag_val == 0:
+                    return
+                # set flag to 0 and delete next 24 bits
+                bits[flag_pos] = 0
+                del_at = flag_pos + 1
+                del bits[del_at:del_at + 24]
+
+            mode = cfg.colorimetry.mode
+            if mode == "set_hdr":
+                cp, tc, mc = VUI_HDR10_BT2020
+                ensure_colour_desc_and_set(cp, tc, mc)
+            elif mode == "set_sdr":
+                cp, tc, mc = VUI_BT709
+                ensure_colour_desc_and_set(cp, tc, mc)
+            elif mode == "unset":
+                remove_colour_desc()
+            else:
+                # unknown: do nothing
+                rbsp_after_colorimetry = rbsp_work
+
+            if mode in ("set_hdr", "set_sdr", "unset"):
+                rbsp_after_colorimetry = bitlist_to_rbsp(bits)
+
+    if not want_chroma_loc:
+        return hdr + rbsp_to_ebsp(rbsp_after_colorimetry)
+
+    # ----------------------------
+    # Apply chroma_loc edits on the updated RBSP (re-locate positions)
+    # ----------------------------
     try:
-        loc2 = locate_vui_bits_in_sps(rbsp_work)
+        loc3 = locate_vui_bits_in_sps(rbsp_after_colorimetry)
     except Exception:
-        return hdr + rbsp_to_ebsp(rbsp_work) if changed_simple else nal
+        # If we already changed something, output it; otherwise keep original
+        if changed_simple or cfg.colorimetry.mode is not None:
+            return hdr + rbsp_to_ebsp(rbsp_after_colorimetry)
+        return nal
 
-    if not loc2.ok or not loc2.video_signal_type_present:
-        # Cannot safely insert video_signal_type block here
-        return hdr + rbsp_to_ebsp(rbsp_work) if changed_simple else nal
+    if not loc3.ok or loc3.chroma_loc_info_present_bitpos is None or loc3.chroma_loc_info_present_val is None:
+        return hdr + rbsp_to_ebsp(rbsp_after_colorimetry)
 
-    if loc2.colour_desc_flag_bitpos is None or loc2.colour_desc_flag_val is None:
-        return hdr + rbsp_to_ebsp(rbsp_work) if changed_simple else nal
+    bits2 = rbsp_to_bitlist(rbsp_after_colorimetry)
 
-    bits = rbsp_to_bitlist(rbsp_work)
-
-    def ensure_colour_desc_and_set(cp: int, tc: int, mc: int) -> None:
-        flag_pos = loc2.colour_desc_flag_bitpos
+    def apply_chroma_loc_set(value: int) -> None:
+        flag_pos = loc3.chroma_loc_info_present_bitpos
         assert flag_pos is not None
-        flag_val = loc2.colour_desc_flag_val
+        flag_val = loc3.chroma_loc_info_present_val
 
-        if flag_val == 1:
-            # overwrite existing 3 bytes
-            if loc2.colour_primaries_bitpos is not None:
-                set_byte_at_bitpos(bits, loc2.colour_primaries_bitpos, cp)
-            if loc2.transfer_characteristics_bitpos is not None:
-                set_byte_at_bitpos(bits, loc2.transfer_characteristics_bitpos, tc)
-            if loc2.matrix_coeffs_bitpos is not None:
-                set_byte_at_bitpos(bits, loc2.matrix_coeffs_bitpos, mc)
+        if (
+            flag_val == 1
+            and loc3.chroma_top_ue_start is not None and loc3.chroma_top_ue_end is not None
+            and loc3.chroma_bottom_ue_start is not None and loc3.chroma_bottom_ue_end is not None
+        ):
+            new_ue = ue_to_bits(value)
+
+            # Replace bottom first (higher bitpos) to keep indices valid
+            b0, b1 = loc3.chroma_bottom_ue_start, loc3.chroma_bottom_ue_end
+            del bits2[b0:b1]
+            bits2[b0:b0] = new_ue
+
+            # Replace top
+            t0, t1 = loc3.chroma_top_ue_start, loc3.chroma_top_ue_end
+            del bits2[t0:t1]
+            bits2[t0:t0] = new_ue
             return
 
-        # flag_val == 0: flip to 1 and insert 24 bits (3 bytes) right after the flag bit
-        bits[flag_pos] = 1
-        insert_at = flag_pos + 1
-        ins = []
-        for v in (cp, tc, mc):
-            for i in range(7, -1, -1):
-                ins.append((v >> i) & 1)
-        bits[insert_at:insert_at] = ins
+        if flag_val == 0:
+            # set flag to 1 and insert top+bottom ue(v) immediately after the flag bit
+            bits2[flag_pos] = 1
+            insert_at = flag_pos + 1
+            new_ue = ue_to_bits(value)
+            bits2[insert_at:insert_at] = (new_ue + new_ue)
+            return
 
-    def remove_colour_desc() -> None:
-        flag_pos = loc2.colour_desc_flag_bitpos
+        # If flag=1 but ranges missing, do nothing (unsafe)
+
+    def apply_chroma_loc_unset() -> None:
+        flag_pos = loc3.chroma_loc_info_present_bitpos
         assert flag_pos is not None
-        flag_val = loc2.colour_desc_flag_val
+        flag_val = loc3.chroma_loc_info_present_val
         if flag_val == 0:
             return
-        # set flag to 0 and delete next 24 bits
-        bits[flag_pos] = 0
-        del_at = flag_pos + 1
-        del bits[del_at:del_at + 24]
 
-    mode = cfg.colorimetry.mode
-    if mode == "set_hdr":
-        cp, tc, mc = VUI_HDR10_BT2020
-        ensure_colour_desc_and_set(cp, tc, mc)
-    elif mode == "set_sdr":
-        cp, tc, mc = VUI_BT709
-        ensure_colour_desc_and_set(cp, tc, mc)
-    elif mode == "unset":
-        remove_colour_desc()
-    else:
-        # unknown
-        return hdr + rbsp_to_ebsp(rbsp_work) if changed_simple else nal
+        # set flag to 0 and delete the two ue(v) fields (bottom then top)
+        bits2[flag_pos] = 0
+        if (
+            loc3.chroma_top_ue_start is None or loc3.chroma_top_ue_end is None
+            or loc3.chroma_bottom_ue_start is None or loc3.chroma_bottom_ue_end is None
+        ):
+            return
 
-    new_rbsp = bitlist_to_rbsp(bits)
-    return hdr + rbsp_to_ebsp(new_rbsp)
+        # delete bottom first
+        b0, b1 = loc3.chroma_bottom_ue_start, loc3.chroma_bottom_ue_end
+        del bits2[b0:b1]
+
+        # then top
+        t0, t1 = loc3.chroma_top_ue_start, loc3.chroma_top_ue_end
+        del bits2[t0:t1]
+
+    if cfg.sps_vui.unset_chroma_loc:
+        apply_chroma_loc_unset()
+    elif cfg.sps_vui.chroma_loc is not None:
+        apply_chroma_loc_set(int(cfg.sps_vui.chroma_loc))
+
+    rbsp_final = bitlist_to_rbsp(bits2)
+    return hdr + rbsp_to_ebsp(rbsp_final)
 
 
 # ----------------------------
@@ -944,7 +1109,7 @@ def process_one_nal(sc_len: int, nal: bytes, cfg: EditConfig, state: Dict[str, b
     if len(nal) < 2:
         return start_code + nal
 
-    # SPS edits (Standard/Range + Colorimetry set/unset)
+    # SPS edits (Standard/Range + Colorimetry set/unset + ChromaLoc set/unset)
     if nal_type(nal[:2]) == NAL_SPS:
         nal2 = edit_vui_colorimetry_in_sps(nal, cfg)
         return start_code + nal2
@@ -1157,7 +1322,7 @@ def process_container(input_path: str, output_path: str, cfg: EditConfig) -> Non
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Edit HDR10 SEI (MDCV+CLL) and SPS/VUI signaling (Standard/Range/Colorimetry) in HEVC."
+        description="Edit HDR10 SEI (MDCV+CLL) and SPS/VUI signaling (Standard/Range/Colorimetry/ChromaLoc) in HEVC."
     )
 
     parser.add_argument(
@@ -1207,6 +1372,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Set SPS VUI video_full_range_flag (MediaInfo 'Color range')."
     )
 
+    # New: chroma sample location (MediaInfo Type)
+    chroma_group = parser.add_mutually_exclusive_group()
+    chroma_group.add_argument(
+        "-c", "--chroma-loc", dest="chroma_loc", type=int, default=None,
+        help="Set VUI chroma sample location (MediaInfo '... (Type N)') to N (e.g. 2)."
+    )
+    chroma_group.add_argument(
+        "-x", "--unset-chroma-loc", dest="unset_chroma_loc", action="store_true",
+        help="Remove VUI chroma sample location info so MediaInfo shows no '(Type N)'."
+    )
+    parser.set_defaults(unset_chroma_loc=False)
+
     # New set/unset
     parser.add_argument(
         "-S", "--set", dest="set_mode", default=None, choices=["hdr", "sdr"],
@@ -1237,7 +1414,12 @@ def build_cfg_from_args(args: argparse.Namespace) -> EditConfig:
 
     sps_standard = VIDEO_FORMAT_INV[args.standard] if args.standard is not None else None
     sps_range = RANGE_INV[args.range] if args.range is not None else None
-    sps_vui = EditSpsVui(standard=sps_standard, full_range=sps_range)
+    sps_vui = EditSpsVui(
+        standard=sps_standard,
+        full_range=sps_range,
+        chroma_loc=args.chroma_loc,
+        unset_chroma_loc=bool(args.unset_chroma_loc),
+    )
 
     # Decide modes (unset has priority over set if both given)
     colorimetry = ColorimetryMode(mode=None)
